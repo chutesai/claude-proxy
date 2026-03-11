@@ -91,3 +91,144 @@ pub async fn get_available_models(app: &App) -> Vec<ModelInfo> {
     let cache = app.models_cache.read().await;
     cache.as_ref().cloned().unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::CircuitBreakerState;
+    use axum::{http::StatusCode, routing::get, Json, Router};
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn make_app(backend_url: String, cached_models: Option<Vec<ModelInfo>>) -> App {
+        App {
+            client: reqwest::Client::new(),
+            backend_url,
+            models_cache: Arc::new(RwLock::new(cached_models)),
+            circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState::new(false))),
+        }
+    }
+
+    async fn spawn_models_server(status: StatusCode, body: Value) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/models",
+            get({
+                let body = body.clone();
+                move || {
+                    let body = body.clone();
+                    async move { (status, Json(body)) }
+                }
+            }),
+        );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{addr}/v1/chat/completions")
+    }
+
+    #[test]
+    fn test_models_url_from_backend_url_replaces_standard_path() {
+        assert_eq!(
+            models_url_from_backend_url("http://localhost:8000/v1/chat/completions"),
+            "http://localhost:8000/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_models_url_from_backend_url_falls_back_for_nonstandard_path() {
+        assert_eq!(
+            models_url_from_backend_url("http://localhost:8000/custom/chat"),
+            "http://localhost:8000/custom/chat/../models"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_models_cache_parses_models_response() {
+        let backend_url = spawn_models_server(
+            StatusCode::OK,
+            json!({
+                "data": [
+                    {
+                        "id": "zai-org/GLM-4.5-Air",
+                        "price": { "input": { "usd": 0.1 }, "output": { "usd": 0.2 } },
+                        "supported_features": []
+                    },
+                    {
+                        "id": "deepseek-r1",
+                        "pricing": { "prompt": 0.2, "completion": 0.4 },
+                        "supported_features": ["thinking", "extended_thinking"]
+                    }
+                ]
+            }),
+        )
+        .await;
+        let app = make_app(backend_url, None);
+
+        refresh_models_cache(&app).await.unwrap();
+
+        let cache = app.models_cache.read().await;
+        let models = cache.as_ref().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "zai-org/GLM-4.5-Air");
+        assert_eq!(models[0].input_price_usd, Some(0.1));
+        assert_eq!(models[1].id, "deepseek-r1");
+        assert_eq!(models[1].output_price_usd, Some(0.4));
+        assert!(models[1]
+            .supported_features
+            .contains(&"thinking".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_models_cache_returns_error_on_non_success() {
+        let backend_url = spawn_models_server(
+            StatusCode::BAD_GATEWAY,
+            json!({ "error": "backend unavailable" }),
+        )
+        .await;
+        let app = make_app(backend_url, None);
+
+        let result = refresh_models_cache(&app).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_available_models_returns_cached_models_without_fetch() {
+        let cached_models = vec![ModelInfo {
+            id: "cached-model".into(),
+            input_price_usd: Some(1.0),
+            output_price_usd: Some(2.0),
+            supported_features: vec![],
+        }];
+        let app = make_app(
+            "http://127.0.0.1:9/v1/chat/completions".into(),
+            Some(cached_models),
+        );
+
+        let models = get_available_models(&app).await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "cached-model");
+    }
+
+    #[tokio::test]
+    async fn test_get_available_models_fetches_when_cache_is_empty() {
+        let backend_url = spawn_models_server(
+            StatusCode::OK,
+            json!({
+                "data": [
+                    { "id": "fetched-model", "supported_features": [] }
+                ]
+            }),
+        )
+        .await;
+        let app = make_app(backend_url, None);
+
+        let models = get_available_models(&app).await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "fetched-model");
+    }
+}

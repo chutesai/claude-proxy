@@ -134,3 +134,86 @@ pub struct OAIUsage {
     #[allow(dead_code)]
     pub total_tokens: Option<u32>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_deserialize_stream_chunk_with_reasoning_and_tool_calls() {
+        let chunk: OAIStreamChunk = serde_json::from_value(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 123,
+            "model": "deepseek-r1",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "reasoning_content": "thinking...",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\":\"README.md\"}"
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": null
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(chunk.model.as_deref(), Some("deepseek-r1"));
+        assert_eq!(chunk.usage.as_ref().unwrap().total_tokens, Some(15));
+        let delta = chunk.choices[0].delta.as_ref().unwrap();
+        assert_eq!(delta.reasoning_content.as_deref(), Some("thinking..."));
+        assert_eq!(
+            delta.tool_calls.as_ref().unwrap()[0].id.as_deref(),
+            Some("call_1")
+        );
+    }
+
+    #[test]
+    fn test_deserialize_non_streaming_chunk_message() {
+        let chunk: OAIStreamChunk = serde_json::from_value(json!({
+            "id": "chatcmpl-2",
+            "object": "chat.completion",
+            "model": "zai-org/GLM-4.5-Air",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "hello"
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": 1
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            chunk.choices[0].message.as_ref().unwrap()["content"],
+            json!("hello")
+        );
+        assert_eq!(chunk.usage.as_ref().unwrap().prompt_tokens, Some(2));
+    }
+}

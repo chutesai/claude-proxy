@@ -263,6 +263,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "tokio-stream",
+ "tower",
  "tower-http",
 ]
 

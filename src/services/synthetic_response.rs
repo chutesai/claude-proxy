@@ -115,3 +115,38 @@ pub async fn send_synthetic_text_response(
         )
         .await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_send_synthetic_text_response_emits_full_event_sequence() {
+        let (tx, mut rx) = mpsc::channel(8);
+
+        send_synthetic_text_response(&tx, "deepseek-r1", "hello world", "end_turn", 12, 7).await;
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(format!("{event:?}"));
+        }
+
+        assert_eq!(events.len(), 6);
+        assert!(events.iter().any(|event| event.contains("message_start")));
+        assert!(events
+            .iter()
+            .any(|event| event.contains("content_block_delta")));
+        assert!(events.iter().any(|event| event.contains("hello world")));
+        assert!(events.iter().any(|event| event.contains("end_turn")));
+        assert!(events.iter().any(|event| event.contains("message_stop")));
+    }
+
+    #[tokio::test]
+    async fn test_send_synthetic_text_response_handles_closed_receiver() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        send_synthetic_text_response(&tx, "model", "content", "error", 1, 1).await;
+    }
+}

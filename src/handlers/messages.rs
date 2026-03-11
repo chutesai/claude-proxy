@@ -1875,7 +1875,21 @@ pub async fn messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{App, CircuitBreakerState};
+    use axum::{
+        body::to_bytes,
+        extract::State,
+        http::{
+            header::{AUTHORIZATION, CONTENT_TYPE},
+            HeaderMap, HeaderValue, StatusCode,
+        },
+        response::{IntoResponse, Response},
+        routing::{get, post},
+        Json, Router,
+    };
     use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     #[test]
     fn test_content_uses_cache_control_detects_block_marker() {
@@ -1913,5 +1927,869 @@ mod tests {
                 json!({"type": "text", "text": "second"}),
             ]
         );
+    }
+
+    fn auth_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer test"));
+        headers
+    }
+
+    fn test_app(backend_url: String, circuit_open: bool) -> App {
+        App {
+            client: reqwest::Client::new(),
+            backend_url,
+            models_cache: Arc::new(RwLock::new(None)),
+            circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState {
+                consecutive_failures: if circuit_open { 5 } else { 0 },
+                last_failure_time: None,
+                is_open: circuit_open,
+                enabled: circuit_open,
+            })),
+        }
+    }
+
+    async fn spawn_mock_backend() -> String {
+        async fn models_handler() -> Json<Value> {
+            Json(json!({
+                "data": [
+                    {
+                        "id": "zai-org/GLM-4.5-Air",
+                        "price": { "input": { "usd": 0.1 }, "output": { "usd": 0.2 } },
+                        "supported_features": []
+                    },
+                    {
+                        "id": "deepseek-r1",
+                        "price": { "input": { "usd": 0.2 }, "output": { "usd": 0.4 } },
+                        "supported_features": ["thinking", "extended_thinking"]
+                    }
+                ]
+            }))
+        }
+
+        async fn chat_handler(Json(payload): Json<Value>) -> Response {
+            let model = payload
+                .get("model")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let stream = payload
+                .get("stream")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let has_tools = payload
+                .get("tools")
+                .and_then(|value| value.as_array())
+                .map(|tools| !tools.is_empty())
+                .unwrap_or(false);
+            let include_reasoning = model == "deepseek-r1";
+
+            if model == "missing-model" {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": {
+                            "message": format!("model '{model}' not found"),
+                            "type": "not_found"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+
+            if stream {
+                let mut chunks = vec![json!({
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+                })];
+
+                if include_reasoning {
+                    chunks.push(json!({
+                        "id": "chatcmpl-mock",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{ "index": 0, "delta": { "reasoning_content": "I reasoned briefly." }, "finish_reason": Value::Null }]
+                    }));
+                }
+
+                if has_tools {
+                    chunks.push(json!({
+                        "id": "chatcmpl-mock",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "call_mock_1",
+                                    "type": "function",
+                                    "function": { "name": "read_file" }
+                                }]
+                            },
+                            "finish_reason": Value::Null
+                        }]
+                    }));
+                    chunks.push(json!({
+                        "id": "chatcmpl-mock",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "function": { "arguments": "{\"path\":\"README.md\"}" }
+                                }]
+                            },
+                            "finish_reason": Value::Null
+                        }]
+                    }));
+                } else {
+                    chunks.push(json!({
+                        "id": "chatcmpl-mock",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{ "index": 0, "delta": { "content": "Mock backend response." }, "finish_reason": Value::Null }]
+                    }));
+                }
+
+                chunks.push(json!({
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": if has_tools { "tool_calls" } else { "stop" } }],
+                    "usage": { "prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20 }
+                }));
+
+                let body = format!(
+                    "{}data: [DONE]\n\n",
+                    chunks
+                        .into_iter()
+                        .map(|chunk| format!("data: {chunk}\n\n"))
+                        .collect::<String>()
+                );
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                return (headers, body).into_response();
+            }
+
+            let mut message = json!({
+                "role": "assistant",
+                "content": "Mock backend response."
+            });
+
+            if include_reasoning {
+                message["reasoning_content"] = json!("I reasoned briefly.");
+            }
+
+            if has_tools {
+                message = json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_mock_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"README.md\"}"
+                        }
+                    }]
+                });
+            }
+
+            Json(json!({
+                "id": "chatcmpl-mock",
+                "object": "chat.completion",
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": if has_tools { "tool_calls" } else { "stop" }
+                }],
+                "usage": { "prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20 }
+            }))
+            .into_response()
+        }
+
+        let app = Router::new()
+            .route("/v1/models", get(models_handler))
+            .route("/v1/chat/completions", post(chat_handler));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let models_url = format!("http://{addr}/v1/models");
+        let client = reqwest::Client::new();
+        for _ in 0..20 {
+            if client.get(&models_url).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        format!("http://{addr}/v1/chat/completions")
+    }
+
+    async fn spawn_capturing_backend() -> (String, Arc<RwLock<Vec<Value>>>) {
+        async fn models_handler() -> Json<Value> {
+            Json(json!({
+                "data": [
+                    {
+                        "id": "zai-org/GLM-4.5-Air",
+                        "price": { "input": { "usd": 0.1 }, "output": { "usd": 0.2 } },
+                        "supported_features": []
+                    },
+                    {
+                        "id": "deepseek-r1",
+                        "price": { "input": { "usd": 0.2 }, "output": { "usd": 0.4 } },
+                        "supported_features": ["thinking", "extended_thinking"]
+                    }
+                ]
+            }))
+        }
+
+        let captured = Arc::new(RwLock::new(Vec::<Value>::new()));
+        let captured_for_route = captured.clone();
+
+        let app = Router::new()
+            .route("/v1/models", get(models_handler))
+            .route(
+                "/v1/chat/completions",
+                post(move |Json(payload): Json<Value>| {
+                    let captured = captured_for_route.clone();
+                    async move {
+                        captured.write().await.push(payload.clone());
+
+                        if payload
+                            .get("stream")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                        {
+                            let body = format!(
+                                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                                json!({
+                                    "id": "chatcmpl-capture",
+                                    "object": "chat.completion.chunk",
+                                    "model": payload["model"],
+                                    "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+                                }),
+                                json!({
+                                    "id": "chatcmpl-capture",
+                                    "object": "chat.completion.chunk",
+                                    "model": payload["model"],
+                                    "choices": [{ "index": 0, "delta": { "content": "captured" }, "finish_reason": "stop" }],
+                                    "usage": { "prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3 }
+                                })
+                            );
+                            let mut headers = HeaderMap::new();
+                            headers.insert(
+                                CONTENT_TYPE,
+                                HeaderValue::from_static("text/event-stream"),
+                            );
+                            (headers, body).into_response()
+                        } else {
+                            Json(json!({
+                                "id": "chatcmpl-capture",
+                                "object": "chat.completion",
+                                "model": payload["model"],
+                                "choices": [{
+                                    "index": 0,
+                                    "message": { "role": "assistant", "content": "captured" },
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": { "prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3 }
+                            }))
+                            .into_response()
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let models_url = format!("http://{addr}/v1/models");
+        let client = reqwest::Client::new();
+        for _ in 0..20 {
+            if client.get(&models_url).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        (format!("http://{addr}/v1/chat/completions"), captured)
+    }
+
+    async fn spawn_static_backend(
+        chat_status: StatusCode,
+        chat_content_type: &'static str,
+        chat_body: String,
+        models_status: StatusCode,
+        models_body: Value,
+    ) -> String {
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get({
+                    let models_body = models_body.clone();
+                    move || {
+                        let models_body = models_body.clone();
+                        async move { (models_status, Json(models_body)).into_response() }
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post({
+                    let chat_body = chat_body.clone();
+                    move || {
+                        let chat_body = chat_body.clone();
+                        async move {
+                            let mut response = Response::new(axum::body::Body::from(chat_body));
+                            *response.status_mut() = chat_status;
+                            response
+                                .headers_mut()
+                                .insert(CONTENT_TYPE, HeaderValue::from_static(chat_content_type));
+                            response
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{addr}/v1/chat/completions")
+    }
+
+    async fn unused_backend_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}/v1/chat/completions")
+    }
+
+    async fn response_text(response: Response) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn request_from_value(value: Value) -> ClaudeRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_success_returns_claude_sse() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("event: message_start"));
+        assert!(body.contains("event: content_block_delta"));
+        assert!(body.contains("Mock backend response."));
+        assert!(body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_success_returns_claude_json() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "deepseek-r1",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(parsed["type"], "message");
+        assert_eq!(parsed["role"], "assistant");
+        assert_eq!(parsed["content"][0]["type"], "thinking");
+        assert_eq!(parsed["content"][1]["type"], "text");
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_tool_calls_become_tool_use_blocks() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "read a file" }],
+            "tools": [{
+                "name": "read_file",
+                "description": "Read file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }
+            }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (_, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(parsed["content"][0]["type"], "tool_use");
+        assert_eq!(parsed["content"][0]["name"], "read_file");
+        assert_eq!(parsed["content"][0]["input"]["path"], "README.md");
+        assert_eq!(parsed["stop_reason"], "tool_use");
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_missing_model_returns_synthetic_response() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "missing-model",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (_, body) = response_text(response).await;
+
+        assert!(body.contains("Model `missing-model` not found"));
+        assert!(body.contains("zai-org/GLM-4.5-Air"));
+        assert!(body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_missing_model_returns_model_list_message() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "missing-model",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(parsed["type"], "message");
+        assert!(parsed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Model `missing-model` not found"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_missing_auth_returns_json_error() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages(State(app), HeaderMap::new(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "authentication_error");
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_empty_messages_returns_json_error() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+        assert_eq!(parsed["error"]["message"], "messages must not be empty");
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_open_circuit_breaker_returns_json_error() {
+        let app = test_app(spawn_mock_backend().await, true);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(parsed["error"]["type"], "overloaded_error");
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_connection_failure_returns_bad_gateway_tuple() {
+        let app = test_app(unused_backend_url().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+
+        let error = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, (StatusCode::BAD_GATEWAY, "backend_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_connection_failure_returns_json_error() {
+        let app = test_app(unused_backend_url().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(parsed["error"]["type"], "api_error");
+        assert_eq!(
+            parsed["error"]["message"],
+            "Failed to connect to the configured backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_retryable_backend_error_returns_status_tuple() {
+        let backend_url = spawn_static_backend(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            json!({ "error": { "message": "slow down" } }).to_string(),
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+
+        let error = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            (StatusCode::TOO_MANY_REQUESTS, "backend_error_retryable")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_retryable_backend_error_returns_json_error() {
+        let backend_url = spawn_static_backend(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            json!({ "error": { "message": "slow down" } }).to_string(),
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(parsed["error"]["type"], "rate_limit_error");
+        assert_eq!(parsed["error"]["message"], "slow down");
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_non_retryable_backend_error_returns_sse_error() {
+        let backend_url = spawn_static_backend(
+            StatusCode::FORBIDDEN,
+            "application/json",
+            json!({ "error": { "message": "access denied" } }).to_string(),
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("access denied"));
+        assert!(body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_backend_parse_failure_returns_json_error() {
+        let backend_url = spawn_static_backend(
+            StatusCode::OK,
+            "application/json",
+            "{not-json".into(),
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(parsed["error"]["type"], "api_error");
+        assert_eq!(
+            parsed["error"]["message"],
+            "Failed to parse backend response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_translates_assistant_thinking_and_tool_results_for_backend() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "deepseek-r1",
+            "thinking": { "type": "enabled", "budget_tokens": 256 },
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "step one", "signature": "sig_123" },
+                        { "type": "redacted_thinking", "data": "redacted" },
+                        { "type": "text", "text": "I will use a tool" },
+                        { "type": "tool_use", "id": "call_1", "name": "read_file", "input": { "path": "README.md" } }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "call_1", "content": "contents" },
+                        { "type": "text", "text": "thanks" }
+                    ]
+                }
+            ],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+
+        let captured = captured.read().await;
+        let payload = &captured[0];
+        let messages = payload["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<think>step one\n[redacted reasoning]</think>"));
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["name"],
+            json!("read_file")
+        );
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], json!("call_1"));
+        assert_eq!(messages[1]["content"], json!("contents"));
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], json!("thanks"));
+        assert_eq!(payload["thinking"]["type"], json!("enabled"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_auto_enables_thinking_for_reasoning_model_from_cache() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        *app.models_cache.write().await = Some(vec![crate::models::ModelInfo {
+            id: "deepseek-r1".into(),
+            input_price_usd: None,
+            output_price_usd: None,
+            supported_features: vec!["thinking".into()],
+        }]);
+
+        let request = request_from_value(json!({
+            "model": "deepseek-r1",
+            "messages": [{ "role": "user", "content": "reason this through" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+
+        let captured = captured.read().await;
+        let payload = &captured[0];
+
+        assert_eq!(payload["thinking"]["type"], json!("enabled"));
+        assert_eq!(
+            payload["thinking"]["budget_tokens"],
+            json!(crate::constants::DEFAULT_THINKING_BUDGET_TOKENS)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_truncates_stop_sequences_for_backend_payload() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stop_sequences": ["a", "b", "c", "d", "e"],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+
+        let captured = captured.read().await;
+        let stop = captured[0]["stop"].as_array().unwrap();
+
+        assert_eq!(stop.len(), 4);
+        assert_eq!(stop[0], json!("a"));
+        assert_eq!(stop[3], json!("d"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_translates_documents_for_backend_payload() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "see attached" },
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "ZmFrZQ=="
+                        }
+                    },
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.com/file.pdf"
+                        }
+                    }
+                ]
+            }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+
+        let captured = captured.read().await;
+        let payload = &captured[0];
+        let content = payload["messages"][0]["content"].as_array().unwrap();
+
+        assert_eq!(payload["messages"][0]["role"], json!("user"));
+        assert_eq!(content[0]["type"], json!("text"));
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            json!("data:application/pdf;base64,ZmFrZQ==")
+        );
+        assert_eq!(content[2]["type"], json!("text"));
+        assert!(content[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Unsupported document: source_type=url"));
     }
 }

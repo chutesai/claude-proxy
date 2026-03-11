@@ -85,3 +85,33 @@ pub fn get_price_tier(input_price: Option<f64>, output_price: Option<f64>) -> &'
         "💎" // Premium (> $15/M tokens)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::get_price_tier;
+
+    #[test]
+    fn test_get_price_tier_without_pricing() {
+        assert_eq!(get_price_tier(None, None), "    ");
+    }
+
+    #[test]
+    fn test_get_price_tier_cheap() {
+        assert_eq!(get_price_tier(Some(0.2), Some(0.4)), "💰");
+    }
+
+    #[test]
+    fn test_get_price_tier_affordable() {
+        assert_eq!(get_price_tier(Some(2.0), Some(4.0)), "💵");
+    }
+
+    #[test]
+    fn test_get_price_tier_moderate() {
+        assert_eq!(get_price_tier(Some(8.0), Some(10.0)), "💸");
+    }
+
+    #[test]
+    fn test_get_price_tier_premium() {
+        assert_eq!(get_price_tier(Some(20.0), Some(30.0)), "💎");
+    }
+}

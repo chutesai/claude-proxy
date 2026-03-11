@@ -81,3 +81,76 @@ impl CircuitBreakerState {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_circuit_breaker_starts_closed() {
+        let breaker = CircuitBreakerState::new(true);
+        assert!(!breaker.is_open);
+        assert_eq!(breaker.consecutive_failures, 0);
+        assert!(breaker.enabled);
+    }
+
+    #[test]
+    fn test_circuit_breaker_record_success_resets_state() {
+        let mut breaker = CircuitBreakerState::new(true);
+        breaker.consecutive_failures = 3;
+        breaker.is_open = true;
+        breaker.last_failure_time = Some(SystemTime::now());
+
+        breaker.record_success();
+
+        assert_eq!(breaker.consecutive_failures, 0);
+        assert!(!breaker.is_open);
+        assert!(breaker.last_failure_time.is_none());
+    }
+
+    #[test]
+    fn test_circuit_breaker_opens_after_threshold_failures() {
+        let mut breaker = CircuitBreakerState::new(true);
+        for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            breaker.record_failure();
+        }
+
+        assert!(breaker.is_open);
+        assert_eq!(
+            breaker.consecutive_failures,
+            CIRCUIT_BREAKER_FAILURE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_disabled_always_allows_request() {
+        let mut breaker = CircuitBreakerState::new(false);
+        breaker.is_open = true;
+        breaker.consecutive_failures = CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+
+        assert!(breaker.should_allow_request());
+    }
+
+    #[test]
+    fn test_circuit_breaker_blocks_request_while_open_before_timeout() {
+        let mut breaker = CircuitBreakerState::new(true);
+        breaker.is_open = true;
+        breaker.consecutive_failures = CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+        breaker.last_failure_time = Some(SystemTime::now());
+
+        assert!(!breaker.should_allow_request());
+    }
+
+    #[test]
+    fn test_circuit_breaker_recovers_after_timeout() {
+        let mut breaker = CircuitBreakerState::new(true);
+        breaker.is_open = true;
+        breaker.consecutive_failures = CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+        breaker.last_failure_time = Some(SystemTime::now() - Duration::from_secs(31));
+
+        assert!(breaker.should_allow_request());
+        assert!(!breaker.is_open);
+        assert_eq!(breaker.consecutive_failures, 0);
+    }
+}

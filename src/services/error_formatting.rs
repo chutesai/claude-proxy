@@ -141,3 +141,62 @@ pub fn build_model_list_content(
     content.push_str("---\n\n💡 **To switch models:** Use `/model <model-name>`");
     content
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ModelInfo;
+
+    #[test]
+    fn test_format_backend_error_includes_model_and_token_suggestions() {
+        let message = format_backend_error(
+            "requested a total of 120000 tokens which exceed maximum context length of 64000 tokens",
+            r#"{"model":"deepseek-r1"}"#,
+        );
+
+        assert!(message.contains("Model: deepseek-r1"));
+        assert!(message.contains("Requested: 120000"));
+        assert!(message.contains("Limit: 64000"));
+        assert!(message.contains("Reduce message history"));
+    }
+
+    #[test]
+    fn test_format_backend_error_adds_rate_limit_suggestions() {
+        let message = format_backend_error("rate limit exceeded", "{}");
+        assert!(message.contains("Wait a moment before retrying"));
+        assert!(message.contains("Check your API quota"));
+    }
+
+    #[test]
+    fn test_format_backend_error_adds_quota_suggestions() {
+        let message = format_backend_error("insufficient quota", "{}");
+        assert!(message.contains("Check your account balance"));
+        assert!(message.contains("Verify API key permissions"));
+    }
+
+    #[test]
+    fn test_build_model_list_content_groups_reasoning_and_standard_models() {
+        let models = vec![
+            ModelInfo {
+                id: "zai-org/GLM-4.5-Air".into(),
+                input_price_usd: Some(0.1),
+                output_price_usd: Some(0.2),
+                supported_features: vec![],
+            },
+            ModelInfo {
+                id: "deepseek-r1".into(),
+                input_price_usd: Some(0.2),
+                output_price_usd: Some(0.4),
+                supported_features: vec!["reasoning".into()],
+            },
+        ];
+
+        let content = build_model_list_content("missing-model", &models);
+        assert!(content.contains("Model `missing-model` not found"));
+        assert!(content.contains("### 🧠 REASONING"));
+        assert!(content.contains("deepseek-r1"));
+        assert!(content.contains("### ⚡ STANDARD"));
+        assert!(content.contains("zai-org/GLM-4.5-Air"));
+        assert!(content.contains("To switch models"));
+    }
+}
