@@ -91,14 +91,14 @@ validate_request() {
   
   if [ -z "$errors" ]; then
     echo -e "  ${GREEN}✓ PASS${NC}"
-    ((PASSED++))
+    PASSED=$((PASSED + 1))
   else
     echo -e "  ${RED}✗ FAIL${NC}"
     echo -e "$errors" | head -10
     echo ""
     echo "  Response preview:"
     echo "$response" | head -10 | sed 's/^/    /'
-    ((FAILED++))
+    FAILED=$((FAILED + 1))
   fi
   echo ""
 }
@@ -162,11 +162,11 @@ fi
 
 if [ -z "$ERRORS" ]; then
   echo -e "  ${GREEN}✓ PASS${NC}"
-  ((PASSED++))
+  PASSED=$((PASSED + 1))
 else
   echo -e "  ${RED}✗ FAIL${NC}"
   echo -e "$ERRORS"
-  ((FAILED++))
+  FAILED=$((FAILED + 1))
 fi
 echo ""
 
@@ -198,11 +198,11 @@ fi
 
 if [ -z "$ERRORS" ]; then
   echo -e "  ${GREEN}✓ PASS${NC}"
-  ((PASSED++))
+  PASSED=$((PASSED + 1))
 else
   echo -e "  ${RED}✗ FAIL${NC}"
   echo -e "$ERRORS"
-  ((FAILED++))
+  FAILED=$((FAILED + 1))
 fi
 echo ""
 
