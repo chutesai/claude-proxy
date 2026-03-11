@@ -1,5 +1,5 @@
-use serde_json::Value;
 use crate::models::{App, ModelInfo};
+use serde_json::Value;
 
 /// Build `/v1/models` URL from backend chat completions URL.
 fn models_url_from_backend_url(backend_url: &str) -> String {

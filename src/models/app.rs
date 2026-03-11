@@ -1,11 +1,8 @@
-use std::{
-    sync::Arc,
-    time::SystemTime,
-};
-use tokio::sync::RwLock;
+use crate::constants::*;
 use log::warn;
 use reqwest::Client;
-use crate::constants::*;
+use std::{sync::Arc, time::SystemTime};
+use tokio::sync::RwLock;
 
 #[derive(Clone, Debug)]
 pub struct ModelInfo {
@@ -56,7 +53,10 @@ impl CircuitBreakerState {
         self.last_failure_time = Some(SystemTime::now());
         if self.consecutive_failures >= CIRCUIT_BREAKER_FAILURE_THRESHOLD {
             self.is_open = true;
-            warn!("🔴 Circuit breaker opened after {} consecutive failures", self.consecutive_failures);
+            warn!(
+                "🔴 Circuit breaker opened after {} consecutive failures",
+                self.consecutive_failures
+            );
         }
     }
 

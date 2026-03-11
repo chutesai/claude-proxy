@@ -3,11 +3,7 @@ use axum::{
     Router,
 };
 use log::info;
-use std::{
-    env,
-    sync::Arc,
-    time::Duration,
-};
+use std::{env, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 // Import our modules
@@ -40,11 +36,20 @@ async fn main() {
     info!("🚀 Claude-to-OpenAI Proxy starting...");
     info!("   Backend URL: {}", backend_url);
     info!("   Backend Timeout: {}s", backend_timeout_secs);
-    info!("   Circuit Breaker: {}", if circuit_breaker_enabled { "enabled" } else { "disabled" });
+    info!(
+        "   Circuit Breaker: {}",
+        if circuit_breaker_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     info!("   Mode: Passthrough with case-correction");
 
     let models_cache = Arc::new(RwLock::new(None));
-    let circuit_breaker = Arc::new(RwLock::new(CircuitBreakerState::new(circuit_breaker_enabled)));
+    let circuit_breaker = Arc::new(RwLock::new(CircuitBreakerState::new(
+        circuit_breaker_enabled,
+    )));
 
     let app = App {
         client: reqwest::Client::builder()
@@ -62,7 +67,10 @@ async fn main() {
     // Initial model cache load (blocking - must complete before accepting requests)
     info!("🔄 Loading initial model cache...");
     if let Err(e) = refresh_models_cache(&app).await {
-        log::warn!("⚠️  Failed to load initial model cache: {}. Continuing anyway.", e);
+        log::warn!(
+            "⚠️  Failed to load initial model cache: {}. Continuing anyway.",
+            e
+        );
     }
 
     // Background model cache refresh (every 60s) with graceful shutdown
@@ -74,7 +82,7 @@ async fn main() {
                 if let Err(e) = refresh_models_cache(&app_clone).await {
                     log::warn!("Failed to refresh models cache: {}", e);
                 }
-                
+
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {
                         // Continue loop
@@ -104,19 +112,18 @@ async fn main() {
         .await
         .unwrap();
     info!("   Listening on: 0.0.0.0:{}", port);
-    
+
     // Graceful shutdown: use axum's built-in mechanism
-    let server = axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-            info!("🛑 Received shutdown signal, draining connections...");
-        });
-    
+    let server = axum::serve(listener, router).with_graceful_shutdown(async {
+        tokio::signal::ctrl_c().await.ok();
+        info!("🛑 Received shutdown signal, draining connections...");
+    });
+
     // Run server (this will complete when graceful shutdown finishes)
     if let Err(e) = server.await {
         log::error!("Server error: {}", e);
     }
-    
+
     // After server is shut down, clean up background tasks
     info!("🧹 Cleaning up background tasks...");
     let _ = shutdown_tx.send(()).await;

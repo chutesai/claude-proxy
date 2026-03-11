@@ -1,9 +1,12 @@
+use crate::models::ModelInfo;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::models::ModelInfo;
 
 /// Passthrough model with case-correction from cache
-pub async fn normalize_model_name(model: &str, models_cache: &Arc<RwLock<Option<Vec<ModelInfo>>>>) -> String {
+pub async fn normalize_model_name(
+    model: &str,
+    models_cache: &Arc<RwLock<Option<Vec<ModelInfo>>>>,
+) -> String {
     let model_lower = model.to_lowercase();
     let cache = models_cache.read().await;
     if let Some(models) = cache.as_ref() {

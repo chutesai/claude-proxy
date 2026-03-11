@@ -40,7 +40,9 @@ impl SseEventParser {
 
         loop {
             // Find next newline
-            let Some(pos) = self.buf.iter().position(|&b| b == b'\n') else { break };
+            let Some(pos) = self.buf.iter().position(|&b| b == b'\n') else {
+                break;
+            };
 
             // Take the line including the newline
             let line_bytes: Vec<u8> = self.buf.drain(..=pos).collect();
@@ -73,7 +75,9 @@ impl SseEventParser {
                 // Convert safely to string now that we have full lines
                 // We use from_utf8_lossy here which is safe because we are at line boundaries
                 // (assuming SSE lines are valid UTF-8, which they should be)
-                let s = String::from_utf8_lossy(data_content).trim_start().to_string();
+                let s = String::from_utf8_lossy(data_content)
+                    .trim_start()
+                    .to_string();
                 self.cur_data_lines.push(s);
             }
         }
@@ -85,23 +89,25 @@ impl SseEventParser {
     pub fn flush(mut self) -> Option<String> {
         // If there is data in buf that doesn't end in newline, we should try to process it
         if !self.buf.is_empty() {
-             // Process remaining buffer as one last line
-             let line_bytes = std::mem::take(&mut self.buf);
-             let mut len = line_bytes.len();
-             // Trim logic (though unlikely to have trailing \n here due to loop condition)
-             if len > 0 && line_bytes[len - 1] == b'\n' {
+            // Process remaining buffer as one last line
+            let line_bytes = std::mem::take(&mut self.buf);
+            let mut len = line_bytes.len();
+            // Trim logic (though unlikely to have trailing \n here due to loop condition)
+            if len > 0 && line_bytes[len - 1] == b'\n' {
                 len -= 1;
                 if len > 0 && line_bytes[len - 1] == b'\r' {
                     len -= 1;
                 }
-             }
-             let trimmed = &line_bytes[..len];
+            }
+            let trimmed = &line_bytes[..len];
 
-             if trimmed.starts_with(b"data:") {
-                 let data_content = &trimmed[5..];
-                 let s = String::from_utf8_lossy(data_content).trim_start().to_string();
-                 self.cur_data_lines.push(s);
-             }
+            if trimmed.starts_with(b"data:") {
+                let data_content = &trimmed[5..];
+                let s = String::from_utf8_lossy(data_content)
+                    .trim_start()
+                    .to_string();
+                self.cur_data_lines.push(s);
+            }
         }
 
         if !self.cur_data_lines.is_empty() {
@@ -192,9 +198,7 @@ mod tests {
     #[test]
     fn test_sse_parser_ignores_non_data_lines() {
         let mut parser = SseEventParser::new();
-        let events = parser.push_and_drain_events(
-            b"event: message\nid: 123\ndata: payload\n\n"
-        );
+        let events = parser.push_and_drain_events(b"event: message\nid: 123\ndata: payload\n\n");
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], "payload");
@@ -240,9 +244,7 @@ mod tests {
     #[test]
     fn test_sse_parser_json_payload() {
         let mut parser = SseEventParser::new();
-        let events = parser.push_and_drain_events(
-            b"data: {\"key\":\"value\"}\n\n"
-        );
+        let events = parser.push_and_drain_events(b"data: {\"key\":\"value\"}\n\n");
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], r#"{"key":"value"}"#);

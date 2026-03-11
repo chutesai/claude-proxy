@@ -1,7 +1,7 @@
-/// Application-wide constants
-///
-/// This module centralizes all magic numbers and configuration values used throughout
-/// the application for better maintainability and documentation.
+// Application-wide constants.
+//
+// This module centralizes magic numbers and configuration values used throughout
+// the application for better maintainability and documentation.
 
 // ============================================================================
 // Request Validation Limits
@@ -73,12 +73,12 @@ pub fn get_price_tier(input_price: Option<f64>, output_price: Option<f64>) -> &'
         (Some(p), None) | (None, Some(p)) => p,
         (None, None) => return "    ", // No pricing info
     };
-    
+
     // Price tiers (rough estimates)
     if avg_price < 1.0 {
         "💰" // Very cheap (< $1/M tokens average)
     } else if avg_price < 5.0 {
-        "💵"  // Affordable ($1-5/M tokens)
+        "💵" // Affordable ($1-5/M tokens)
     } else if avg_price < 15.0 {
         "💸" // Moderate ($5-15/M tokens)
     } else {
