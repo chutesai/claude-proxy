@@ -30,10 +30,14 @@ CHUTES_TEST_API_KEY=cpk_key ./test.sh --ci --all
 - `test_token_count.sh` - Token counting endpoint
 - `test_model_404.sh` - 404 response handling
 - `test_model_case_correction.sh` - Case-insensitive matching
+- `test_non_streaming.sh` - `stream: false` JSON response and error handling
 
 **Validation:**
 - `validate_claude_api.sh` - API spec compliance
 - `../validate_tests.sh` - Test script compliance
+
+**CI support:**
+- `mock_openai_backend.py` - Local OpenAI-compatible backend used by GitHub Actions
 
 ## Structure
 
@@ -46,7 +50,8 @@ tests/
 │   ├── tool_*.json (3 files)
 │   └── parallel_request.json
 │
-└── test_*.sh                # 10 test scripts
+├── mock_openai_backend.py   # Deterministic CI backend
+└── test_*.sh                # 11 test scripts
 ```
 
 ## Coverage
@@ -59,6 +64,7 @@ tests/
 - All 6 SSE event types
 - Model discovery (404 handling, case-insensitive matching)
 - Concurrent requests
+- Non-streaming JSON responses and Anthropic-style JSON errors
 
 **Partially tested:**
 - Authentication flows (logged but not fully validated)
@@ -110,4 +116,3 @@ All tests conform to Claude Messages API specification:
 - System prompts as top-level field
 - Tools with `input_schema` (not `parameters`)
 - Validates Claude SSE events in responses
-

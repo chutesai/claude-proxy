@@ -2,11 +2,14 @@
 # Test the Claude proxy with a simple request
 # Usage: ./test_request.sh [proxy_url]
 
-PROXY_URL="${1:-http://127.0.0.1:8080}"
+PROXY_URL="${PROXY_URL:-${1:-http://127.0.0.1:8080}}"
 
 # Load API_KEY and MODEL from .env if present
 if [ -f .env ]; then
-  export $(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs)
+  env_vars=$(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs 2>/dev/null || true)
+  if [ -n "$env_vars" ]; then
+    export $env_vars
+  fi
 fi
 
 # Use MODEL from env or default
@@ -39,4 +42,3 @@ eval $CURL_CMD
 
 # Optionally validate Claude SSE response format
 # Expected events: message_start, content_block_start, content_block_delta (with text_delta), message_stop
-

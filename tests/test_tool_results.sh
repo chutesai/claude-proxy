@@ -6,12 +6,21 @@ set -e
 PROXY_URL="${PROXY_URL:-http://localhost:8080}"
 MODEL="${MODEL:-claude-3-5-sonnet-20241022}"
 
+if [ -f .env ]; then
+  env_vars=$(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs 2>/dev/null || true)
+  if [ -n "$env_vars" ]; then
+    export $env_vars
+  fi
+fi
+
+API_KEY="${CHUTES_TEST_API_KEY:-${API_KEY:-test}}"
+
 echo "🔧 Testing Tool Result Message Handling"
 echo "========================================"
 echo ""
 
 # Replace model placeholder
-sed "s/{{MODEL}}/$MODEL/g" tests/payloads/tool_use_with_result.json > /tmp/tool_test.json
+sed "s|{{MODEL}}|$MODEL|g" tests/payloads/tool_use_with_result.json > /tmp/tool_test.json
 
 echo "📤 Sending tool use conversation with result..."
 echo ""
@@ -19,10 +28,11 @@ echo ""
 response=$(curl -s -X POST "$PROXY_URL/v1/messages" \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
+  -H "Authorization: Bearer $API_KEY" \
   -d @/tmp/tool_test.json)
 
 echo "📥 Response:"
-echo "$response" | jq '.' || echo "$response"
+echo "$response" | jq '.' 2>/dev/null || echo "$response"
 echo ""
 
 # Check for streaming events
@@ -49,4 +59,3 @@ echo "   3. assistant: text + tool_calls"
 echo "   4. tool: result='100' with tool_call_id"
 
 rm -f /tmp/tool_test.json
-

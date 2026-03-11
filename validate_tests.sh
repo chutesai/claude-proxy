@@ -20,8 +20,13 @@ FAIL=0
 check_file() {
   local file=$1
   local errors=0
+  local expects_streaming=true
 
   echo -e "${YELLOW}Checking: ${file}${NC}"
+
+  if [[ "$file" == "tests/test_non_streaming.sh" ]]; then
+    expects_streaming=false
+  fi
 
   # Check 1: Uses /v1/messages endpoint
   if grep -q "/v1/messages" "$file"; then
@@ -54,11 +59,13 @@ check_file() {
     ((errors++))
   fi
 
-  # Check 5: Sets stream: true
-  if grep -q '\"stream\":.*true' "$file"; then
+  # Check 5: Uses the expected stream mode
+  if [ "$expects_streaming" = true ] && grep -q '\"stream\":.*true' "$file"; then
     echo -e "  ${GREEN}✓${NC} Sets stream: true"
+  elif [ "$expects_streaming" = false ] && grep -q '\"stream\":.*false' "$file"; then
+    echo -e "  ${GREEN}✓${NC} Sets stream: false"
   else
-    echo -e "  ${RED}✗${NC} Missing stream: true"
+    echo -e "  ${RED}✗${NC} Missing expected stream mode"
     ((errors++))
   fi
 
@@ -70,14 +77,15 @@ check_file() {
     ((errors++))
   fi
 
-  # Check 7: Checks for Claude SSE events (text, text_delta, message_start, content_block, tool_use)
-  # Note: Simple passthrough tests (like test_request.sh) can skip validation for manual inspection
-  if grep -qE "(text_delta|message_start|content_block|grep.*text|tool_use)" "$file"; then
+  # Check 7: Validate the expected response format
+  if [ "$expects_streaming" = false ] && grep -qE "(jq .*type == \"message\"|jq .*type == \"error\")" "$file"; then
+    echo -e "  ${GREEN}✓${NC} Validates non-streaming JSON format"
+  elif grep -qE "(text_delta|message_start|content_block|grep.*text|tool_use)" "$file"; then
     echo -e "  ${GREEN}✓${NC} Validates Claude SSE events"
   elif [[ "$file" == "test_request.sh" ]]; then
     echo -e "  ${YELLOW}⚠${NC}  Manual inspection test (no automated validation)"
   else
-    echo -e "  ${RED}✗${NC} Doesn't check for Claude SSE events"
+    echo -e "  ${RED}✗${NC} Doesn't check for expected Claude response format"
     ((errors++))
   fi
 

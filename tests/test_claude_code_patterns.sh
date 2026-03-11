@@ -4,11 +4,14 @@
 
 # set -e # Don't exit on error, we want to run all tests
 
-PROXY_URL="${1:-http://127.0.0.1:8080}"
+PROXY_URL="${PROXY_URL:-${1:-http://127.0.0.1:8080}}"
 
 # Load env
 if [ -f .env ]; then
-  export $(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs 2>/dev/null)
+  env_vars=$(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs 2>/dev/null || true)
+  if [ -n "$env_vars" ]; then
+    export $env_vars
+  fi
 fi
 MODEL="${MODEL:-zai-org/GLM-4.5-Air}"
 
@@ -172,4 +175,3 @@ else
   echo "Check logs for details"
   exit 1
 fi
-

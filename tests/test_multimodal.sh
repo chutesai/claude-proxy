@@ -6,12 +6,21 @@ set -e
 PROXY_URL="${PROXY_URL:-http://localhost:8080}"
 MODEL="${MODEL:-claude-3-5-sonnet-20241022}"
 
+if [ -f .env ]; then
+  env_vars=$(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs 2>/dev/null || true)
+  if [ -n "$env_vars" ]; then
+    export $env_vars
+  fi
+fi
+
+API_KEY="${CHUTES_TEST_API_KEY:-${API_KEY:-test}}"
+
 echo "🖼️  Testing Multimodal Image Support"
 echo "=================================="
 echo ""
 
 # Replace model placeholder
-sed "s/{{MODEL}}/$MODEL/g" tests/payloads/multimodal_image.json > /tmp/multimodal_test.json
+sed "s|{{MODEL}}|$MODEL|g" tests/payloads/multimodal_image.json > /tmp/multimodal_test.json
 
 echo "📤 Sending multimodal request with image..."
 echo ""
@@ -19,10 +28,11 @@ echo ""
 response=$(curl -s -X POST "$PROXY_URL/v1/messages" \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
+  -H "Authorization: Bearer $API_KEY" \
   -d @/tmp/multimodal_test.json)
 
 echo "📥 Response:"
-echo "$response" | jq '.' || echo "$response"
+echo "$response" | jq '.' 2>/dev/null || echo "$response"
 echo ""
 
 # Check if response contains expected SSE events
@@ -48,4 +58,3 @@ echo "   - Claude 3.5 Sonnet: Full support"
 echo "   - Other models: May not support images"
 
 rm -f /tmp/multimodal_test.json
-

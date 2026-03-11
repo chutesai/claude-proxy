@@ -3,13 +3,16 @@
 # Usage: ./test_parallel.sh [proxy_url] [num_parallel]
 # Set DEBUG=1 to see response details: DEBUG=1 ./test_parallel.sh
 
-PROXY_URL="${1:-http://127.0.0.1:8080}"
+PROXY_URL="${PROXY_URL:-${1:-http://127.0.0.1:8080}}"
 NUM_PARALLEL="${2:-3}"
 DEBUG="${DEBUG:-0}"
 
 # Load API_KEY and MODEL from .env if present
 if [ -f .env ]; then
-  export $(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs)
+  env_vars=$(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs 2>/dev/null || true)
+  if [ -n "$env_vars" ]; then
+    export $env_vars
+  fi
 fi
 
 MODEL="${MODEL:-zai-org/GLM-4.5-Air}"
@@ -184,4 +187,3 @@ echo "  • Analyzing multiple files simultaneously"
 echo "  • Processing parallel tool calls"
 echo "  • Handling concurrent user interactions"
 echo ""
-

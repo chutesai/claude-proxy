@@ -2,11 +2,14 @@
 # Test the Claude proxy with thinking/reasoning content
 # Usage: ./test_thinking.sh [proxy_url]
 
-PROXY_URL="${1:-http://127.0.0.1:8080}"
+PROXY_URL="${PROXY_URL:-${1:-http://127.0.0.1:8080}}"
 
 # Load API_KEY and MODEL from .env if present
 if [ -f .env ]; then
-  export $(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs)
+  env_vars=$(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs 2>/dev/null || true)
+  if [ -n "$env_vars" ]; then
+    export $env_vars
+  fi
 fi
 
 # Use a reasoning model to trigger auto-enable thinking
@@ -71,5 +74,3 @@ THINKING_STARTS=$(grep -c 'content_block_start.*"type":"thinking"' /tmp/thinking
 TEXT_STARTS=$(grep -c 'content_block_start.*"type":"text"' /tmp/thinking_test_output.txt || echo 0)
 
 echo "📊 Summary: $THINKING_STARTS thinking block(s), $TEXT_STARTS text block(s)"
-
-
