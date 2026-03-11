@@ -1,9 +1,25 @@
+use crate::constants::*;
+use crate::models::{
+    App, ClaudeContentBlock, ClaudeRequest, OAIChatReq, OAIMessage, OAIStreamChunk,
+};
+use crate::services::{
+    build_model_list_content, extract_client_key, format_backend_error, get_available_models,
+    mask_token, SseEventParser, ToolBuf, ToolsMap,
+};
+use crate::utils::content_extraction::{
+    build_oai_tools, convert_system_content, convert_tool_choice, count_input_tokens,
+    serialize_tool_result_content, translate_finish_reason,
+};
+use crate::utils::normalize_model_name;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::sse::{Event, Sse},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
 };
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -11,70 +27,165 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio_stream::wrappers::ReceiverStream;
-use crate::constants::*;
-use crate::models::{App, ClaudeRequest, ClaudeContentBlock, OAIMessage, OAIChatReq, OAIStreamChunk};
-use crate::services::{SseEventParser, ToolBuf, ToolsMap, extract_client_key, mask_token,
-                     get_available_models, format_backend_error, build_model_list_content};
-use crate::utils::normalize_model_name;
-use crate::utils::content_extraction::{translate_finish_reason, build_oai_tools, convert_system_content, convert_tool_choice, serialize_tool_result_content};
 
-/// Count tokens in a Claude request using tiktoken
-fn count_input_tokens(
-    messages: &[crate::models::ClaudeMessage],
-    system: &Option<serde_json::Value>,
-    tools: &Option<Vec<crate::models::ClaudeTool>>,
-) -> u32 {
-    let mut text_parts = Vec::new();
-    let mut image_count = 0;
-
-    // System prompt
-    if let Some(sys) = system {
-        let sys_text = match sys {
-            serde_json::Value::String(s) => s.clone(),
-            _ => serde_json::to_string(sys).unwrap_or_default(),
-        };
-        if !sys_text.is_empty() {
-            text_parts.push(sys_text);
-        }
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "invalid_request_error",
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
+        _ if status.is_server_error() => "api_error",
+        _ => "invalid_request_error",
     }
+}
 
-    // Messages
-    for msg in messages {
-        let (msg_text, msg_image_count) = crate::utils::content_extraction::extract_text_from_content(&msg.content);
-        if !msg_text.is_empty() {
-            text_parts.push(format!("{}: {}", msg.role, msg_text));
-        }
-        image_count += msg_image_count;
+fn build_error_json_response(status: StatusCode, error_type: &str, message: &str) -> Response {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let body = json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message,
+        },
+        "request_id": format!("req_{}", now),
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "application/json".parse().unwrap());
+    (status, headers, axum::Json(body)).into_response()
+}
+
+fn maybe_error_response(
+    client_wants_stream: bool,
+    status: StatusCode,
+    fallback_code: &'static str,
+    error_type: &'static str,
+    message: &'static str,
+) -> Result<Response, (StatusCode, &'static str)> {
+    if client_wants_stream {
+        Err((status, fallback_code))
+    } else {
+        Ok(build_error_json_response(status, error_type, message))
     }
+}
 
-    // Tools
-    if let Some(tools) = tools {
-        for tool in tools {
-            text_parts.push(tool.name.clone());
-            if let Some(desc) = &tool.description {
-                text_parts.push(desc.clone());
+/// Build SSE response headers
+fn sse_response_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("cache-control", "no-cache".parse().unwrap());
+    headers.insert("connection", "keep-alive".parse().unwrap());
+    headers.insert("x-accel-buffering", "no".parse().unwrap());
+    headers
+}
+
+/// Wrap an SSE stream into an axum Response
+fn into_sse_response(rx: tokio::sync::mpsc::Receiver<Event>) -> Response {
+    let headers = sse_response_headers();
+    let stream = ReceiverStream::new(rx).map(Ok::<Event, Infallible>);
+    (headers, Sse::new(stream)).into_response()
+}
+
+/// Build a non-streaming Claude Messages API JSON response
+fn build_non_streaming_response(
+    model: &str,
+    content_blocks: Vec<Value>,
+    stop_reason: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+) -> Response {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let body = json!({
+        "id": format!("msg_{}", now),
+        "type": "message",
+        "role": "assistant",
+        "content": content_blocks,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "application/json".parse().unwrap());
+    (headers, axum::Json(body)).into_response()
+}
+
+fn content_uses_cache_control(content: &Value) -> bool {
+    content
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("cache_control").is_some())
+        })
+        .unwrap_or(false)
+}
+
+fn extract_backend_error_message(raw: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+        if let Some(message) = parsed
+            .get("error")
+            .and_then(|err| {
+                err.get("message")
+                    .or_else(|| err.get("type"))
+                    .and_then(|value| value.as_str())
+            })
+            .or_else(|| parsed.get("message").and_then(|value| value.as_str()))
+        {
+            let message = message.trim();
+            if !message.is_empty() {
+                return message.to_string();
             }
-            if let Ok(schema_str) = serde_json::to_string(&tool.input_schema) {
-                text_parts.push(schema_str);
-            }
         }
     }
 
-    let combined_text = text_parts.join("\n");
+    let message = raw.trim();
+    if message.is_empty() {
+        "Unknown backend error".to_string()
+    } else {
+        message.to_string()
+    }
+}
 
-    // Count tokens using tiktoken
-    match tiktoken_rs::cl100k_base() {
-        Ok(encoder) => {
-            let text_tokens = encoder.encode_with_special_tokens(&combined_text).len();
-            let image_tokens = image_count * TOKENS_PER_IMAGE;
-            (text_tokens + image_tokens) as u32
+fn push_text_block(content_blocks: &mut Vec<Value>, text: &str) {
+    if !text.is_empty() {
+        content_blocks.push(json!({
+            "type": "text",
+            "text": text,
+        }));
+    }
+}
+
+fn append_non_stream_text_content(content_blocks: &mut Vec<Value>, content: Option<&Value>) {
+    let Some(content) = content else {
+        return;
+    };
+
+    match content {
+        Value::String(text) => push_text_block(content_blocks, text),
+        Value::Array(items) => {
+            for item in items {
+                if let Some(text) = item
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| item.as_str())
+                {
+                    push_text_block(content_blocks, text);
+                }
+            }
         }
-        Err(_) => {
-            // Fallback to rough estimation
-            let text_estimate = std::cmp::max(1, combined_text.len() / CHARS_PER_TOKEN);
-            let image_tokens = image_count * TOKENS_PER_IMAGE;
-            (text_estimate + image_tokens) as u32
-        }
+        _ => {}
     }
 }
 
@@ -82,38 +193,64 @@ pub async fn messages(
     State(app): State<App>,
     headers: HeaderMap,
     axum::Json(cr): axum::Json<ClaudeRequest>,
-) -> Result<
-    (HeaderMap, Sse<impl Stream<Item = Result<Event, Infallible>>>),
-    (StatusCode, &'static str),
-> {
+) -> Result<Response, (StatusCode, &'static str)> {
     let request_start = SystemTime::now();
 
     // Count input tokens
     let input_token_count = count_input_tokens(&cr.messages, &cr.system, &cr.tools);
     log::debug!("📊 Input tokens: {}", input_token_count);
 
+    // Determine streaming mode — default to true (Claude Code always streams)
+    let client_wants_stream = cr.stream.unwrap_or(true);
+    if !client_wants_stream {
+        log::info!("📦 Non-streaming mode requested");
+    }
+
     // Circuit breaker check
     {
         let mut cb = app.circuit_breaker.write().await;
         if !cb.should_allow_request() {
             log::error!("🔴 Circuit breaker is open - rejecting request");
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable_circuit_open"));
+            return maybe_error_response(
+                client_wants_stream,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "backend_unavailable_circuit_open",
+                "overloaded_error",
+                "Backend temporarily unavailable. Please retry shortly.",
+            );
         }
     }
 
     // Request validation
     if cr.messages.is_empty() {
         log::warn!("❌ Validation failed: empty messages");
-        return Err((StatusCode::BAD_REQUEST, "empty_messages"));
+        return maybe_error_response(
+            client_wants_stream,
+            StatusCode::BAD_REQUEST,
+            "empty_messages",
+            "invalid_request_error",
+            "messages must not be empty",
+        );
     }
 
     if cr.messages.len() > MAX_MESSAGES_PER_REQUEST {
-        log::warn!("❌ Validation failed: too many messages ({})", cr.messages.len());
-        return Err((StatusCode::BAD_REQUEST, "too_many_messages"));
+        log::warn!(
+            "❌ Validation failed: too many messages ({})",
+            cr.messages.len()
+        );
+        return maybe_error_response(
+            client_wants_stream,
+            StatusCode::BAD_REQUEST,
+            "too_many_messages",
+            "invalid_request_error",
+            "request exceeds the maximum number of messages",
+        );
     }
 
     // Validate message size (rough check)
-    let total_content_size: usize = cr.messages.iter()
+    let total_content_size: usize = cr
+        .messages
+        .iter()
         .map(|m| {
             if let Some(s) = m.content.as_str() {
                 s.len()
@@ -124,15 +261,33 @@ pub async fn messages(
         .sum();
 
     if total_content_size > MAX_TOTAL_CONTENT_SIZE {
-        log::warn!("❌ Validation failed: content too large ({} bytes)", total_content_size);
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, "content_too_large"));
+        log::warn!(
+            "❌ Validation failed: content too large ({} bytes)",
+            total_content_size
+        );
+        return maybe_error_response(
+            client_wants_stream,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "content_too_large",
+            "request_too_large",
+            "request content exceeds the maximum allowed size",
+        );
     }
 
     // Validate max_tokens if provided
     if let Some(max_tokens) = cr.max_tokens {
-        if max_tokens < MIN_TOKENS_LIMIT || max_tokens > MAX_TOKENS_LIMIT {
-            log::warn!("❌ Validation failed: max_tokens out of range ({})", max_tokens);
-            return Err((StatusCode::BAD_REQUEST, "invalid_max_tokens"));
+        if !(MIN_TOKENS_LIMIT..=MAX_TOKENS_LIMIT).contains(&max_tokens) {
+            log::warn!(
+                "❌ Validation failed: max_tokens out of range ({})",
+                max_tokens
+            );
+            return maybe_error_response(
+                client_wants_stream,
+                StatusCode::BAD_REQUEST,
+                "invalid_max_tokens",
+                "invalid_request_error",
+                "max_tokens is outside the supported range",
+            );
         }
     }
 
@@ -143,14 +298,23 @@ pub async fn messages(
             other => serde_json::to_string(other).unwrap_or_default().len(),
         };
         if system_size > MAX_SYSTEM_PROMPT_SIZE {
-            log::warn!("❌ Validation failed: system prompt too large ({} bytes)", system_size);
-            return Err((StatusCode::BAD_REQUEST, "system_prompt_too_large"));
+            log::warn!(
+                "❌ Validation failed: system prompt too large ({} bytes)",
+                system_size
+            );
+            return maybe_error_response(
+                client_wants_stream,
+                StatusCode::BAD_REQUEST,
+                "system_prompt_too_large",
+                "invalid_request_error",
+                "system prompt exceeds the maximum allowed size",
+            );
         }
     }
 
-    // Log warning for service_tier (not supported by OpenAI, will be ignored)
+    // Log warning for service_tier (accepted for compatibility but not forwarded)
     if cr.service_tier.is_some() {
-        log::debug!("ℹ️  'service_tier' parameter forwarded (may be ignored by backend)");
+        log::debug!("ℹ️  'service_tier' accepted for compatibility but not forwarded to backend");
     }
 
     // Debug: Log incoming headers (names only)
@@ -171,7 +335,9 @@ pub async fn messages(
     let has_client_auth = client_key.is_some();
     log::info!(
         "📨 Request: model={}, client_auth={}, backend={}",
-        cr.model, has_client_auth, app.backend_url
+        cr.model,
+        has_client_auth,
+        app.backend_url
     );
 
     // Normalize model name (case-correction only)
@@ -185,24 +351,29 @@ pub async fn messages(
         // Check if this is a reasoning model by querying model cache
         let is_reasoning_model = {
             let cache = app.models_cache.read().await;
-            cache.as_ref()
+            cache
+                .as_ref()
                 .and_then(|models| {
                     // Look for model in cache
-                    models.iter()
+                    models
+                        .iter()
                         .find(|m| m.id.eq_ignore_ascii_case(&backend_model))
                         .map(|model_info| {
                             // Check if model supports thinking features
                             model_info.supported_features.iter().any(|f| {
-                                f.eq_ignore_ascii_case("thinking") ||
-                                f.eq_ignore_ascii_case("extended_thinking")
+                                f.eq_ignore_ascii_case("thinking")
+                                    || f.eq_ignore_ascii_case("extended_thinking")
                             })
                         })
                 })
-                .unwrap_or(false)  // Default to false if model not found
+                .unwrap_or(false) // Default to false if model not found
         };
 
         if is_reasoning_model {
-            log::info!("🧠 Auto-enabling thinking for reasoning model: {}", backend_model);
+            log::info!(
+                "🧠 Auto-enabling thinking for reasoning model: {}",
+                backend_model
+            );
             Some(crate::models::ThinkingConfig {
                 type_: "enabled".to_string(),
                 budget_tokens: DEFAULT_THINKING_BUDGET_TOKENS,
@@ -213,6 +384,15 @@ pub async fn messages(
     };
 
     let mut msgs = Vec::with_capacity(cr.messages.len() + 1);
+    let mut warned_cache_control = false;
+
+    if let Some(system) = cr.system.as_ref() {
+        if content_uses_cache_control(system) {
+            log::warn!("⚠️ Request uses cache_control (Anthropic prompt caching) — this is silently dropped in translation to OpenAI format. Prompt caching will not be effective.");
+            warned_cache_control = true;
+        }
+    }
+
     if let Some(sys) = cr.system {
         let system_content = convert_system_content(&sys);
         msgs.push(OAIMessage {
@@ -239,6 +419,12 @@ pub async fn messages(
             continue;
         }
 
+        // Detect cache_control usage (Anthropic prompt caching) — warn once
+        if !warned_cache_control && content_uses_cache_control(&m.content) {
+            log::warn!("⚠️ Request uses cache_control (Anthropic prompt caching) — this is silently dropped in translation to OpenAI format. Prompt caching will not be effective.");
+            warned_cache_control = true;
+        }
+
         // Parse content blocks
         log::debug!("🔍 Parsing content blocks (role={})", m.role);
         let blocks = match serde_json::from_value::<Vec<ClaudeContentBlock>>(m.content.clone()) {
@@ -256,12 +442,19 @@ pub async fn messages(
         };
 
         // tool_result blocks require separate "tool" messages
-        let has_tool_results = blocks.iter().any(|b| matches!(b, ClaudeContentBlock::ToolResult { .. }));
+        let has_tool_results = blocks
+            .iter()
+            .any(|b| matches!(b, ClaudeContentBlock::ToolResult { .. }));
 
         if has_tool_results && m.role == "user" {
             // Split tool_result → OpenAI tool messages
             for block in &blocks {
-                if let ClaudeContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                if let ClaudeContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = block
+                {
                     let tool_content = serialize_tool_result_content(content);
                     msgs.push(OAIMessage {
                         role: "tool".into(),
@@ -276,7 +469,7 @@ pub async fn messages(
             let text_parts: Vec<&str> = blocks
                 .iter()
                 .filter_map(|b| match b {
-                    ClaudeContentBlock::Text { text } => Some(text.as_str()),
+                    ClaudeContentBlock::Text { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect();
@@ -292,17 +485,34 @@ pub async fn messages(
         } else if m.role == "assistant" {
             // Assistant messages may include tool_use blocks → OpenAI tool_calls
             let mut thinking_parts = Vec::new();
+            let mut has_redacted_thinking = false;
             let mut text_parts = Vec::new();
             let mut tool_calls = Vec::new();
 
             for block in &blocks {
                 match block {
-                    ClaudeContentBlock::Thinking { thinking } => {
+                    ClaudeContentBlock::Thinking {
+                        thinking,
+                        signature,
+                        ..
+                    } => {
                         thinking_parts.push(thinking.as_str());
-                        log::info!("🧠 INPUT: Extracted thinking block ({} chars) from assistant message", thinking.len());
+                        if signature.is_some() {
+                            log::debug!("🧠 INPUT: Thinking block has signature (cannot be preserved through OAI backend)");
+                        }
+                        log::info!(
+                            "🧠 INPUT: Extracted thinking block ({} chars) from assistant message",
+                            thinking.len()
+                        );
                     }
-                    ClaudeContentBlock::Text { text } => text_parts.push(text.as_str()),
-                    ClaudeContentBlock::ToolUse { id, name, input } => {
+                    ClaudeContentBlock::RedactedThinking { .. } => {
+                        has_redacted_thinking = true;
+                        log::warn!("🧠 INPUT: Redacted thinking block — preserving as marker for multi-turn continuity");
+                    }
+                    ClaudeContentBlock::Text { text, .. } => text_parts.push(text.as_str()),
+                    ClaudeContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         tool_calls.push(json!({
                             "id": id,
                             "type": "function",
@@ -317,15 +527,31 @@ pub async fn messages(
             }
 
             // Interleave thinking: prepend thinking blocks as <think> tags
-            // Always use a string (even if empty) for better backend compatibility
+            // This is the standard format for reasoning-capable OpenAI-compatible backends
+            // (DeepSeek-R1, QwQ, etc. on vLLM/SGLang).
+            //
+            // NOTE: Anthropic's extended thinking requires signatures for multi-turn continuation.
+            // Those signatures cannot survive an OAI backend roundtrip, so multi-turn reasoning
+            // continuity is best-effort only. Redacted thinking blocks are preserved as markers
+            // so the backend at least sees that reasoning occurred.
             let mut combined = String::new();
 
-            // Add thinking content first, wrapped in <think> tags
-            if !thinking_parts.is_empty() {
-                let thinking_text = thinking_parts.join("\n");
-                let thinking_len = thinking_text.len();
-                combined.push_str(&format!("<think>{}</think>\n", thinking_text));
-                log::info!("🧠 INPUT: Converted {} thinking block(s) ({} chars) to interleaved <think> format", thinking_parts.len(), thinking_len);
+            if !thinking_parts.is_empty() || has_redacted_thinking {
+                combined.push_str("<think>");
+                if !thinking_parts.is_empty() {
+                    combined.push_str(&thinking_parts.join("\n"));
+                }
+                if has_redacted_thinking {
+                    // Preserve a marker so the backend knows redacted reasoning existed
+                    combined.push_str("\n[redacted reasoning]");
+                    log::info!("🧠 INPUT: Included redacted thinking marker in <think> block");
+                }
+                combined.push_str("</think>\n");
+                log::info!(
+                    "🧠 INPUT: Converted {} thinking block(s) + {} redacted to <think> format",
+                    thinking_parts.len(),
+                    if has_redacted_thinking { 1 } else { 0 }
+                );
             }
 
             // Add regular text content
@@ -340,40 +566,96 @@ pub async fn messages(
                 role: m.role,
                 content,
                 tool_call_id: None,
-                tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
             });
         } else {
-            // User messages with possible images
-            let mut has_images = false;
+            // User messages with possible images/documents
+            let mut has_multimodal = false;
             let mut oai_content_blocks = Vec::new();
 
             for block in &blocks {
                 match block {
-                    ClaudeContentBlock::Text { text } => {
+                    ClaudeContentBlock::Text { text, .. } => {
                         oai_content_blocks.push(json!({ "type": "text", "text": text }));
                     }
-                    ClaudeContentBlock::Image { source } => {
-                        has_images = true;
+                    ClaudeContentBlock::Image { source, .. } => {
+                        has_multimodal = true;
                         log::info!(
                             "🖼️ Processing image: media_type={}, size={} bytes",
                             source.media_type,
                             source.data.len()
                         );
                         if source.data.starts_with("data:") {
-                            log::warn!("⚠️ Image data already appears to be a data URI (double-encoding?)");
+                            log::warn!(
+                                "⚠️ Image data already appears to be a data URI (double-encoding?)"
+                            );
                         }
-                        // Convert Claude image to OpenAI data URL
                         let data_uri = format!("data:{};base64,{}", source.media_type, source.data);
                         oai_content_blocks.push(json!({
                             "type": "image_url",
                             "image_url": { "url": data_uri }
                         }));
                     }
+                    ClaudeContentBlock::Document { source, .. } => {
+                        let media_type = source.media_type.as_deref().unwrap_or("unknown");
+                        let data_len = source.data.as_deref().map(str::len).unwrap_or(0);
+                        log::warn!(
+                            "⚠️ Document block (media_type={}, source_type={}, size={} bytes): \
+                             best-effort translation — OpenAI Chat Completions API does not natively \
+                             support document inputs. Backend must support data URI documents.",
+                            media_type,
+                            source.source_type,
+                            data_len
+                        );
+                        // Only base64 inline documents can be forwarded as data URIs.
+                        // URL-referenced or file-ID documents would need different handling.
+                        if source.source_type == "base64" {
+                            match (source.media_type.as_deref(), source.data.as_deref()) {
+                                (Some(media_type), Some(data)) => {
+                                    has_multimodal = true;
+                                    let data_uri = format!("data:{};base64,{}", media_type, data);
+                                    oai_content_blocks.push(json!({
+                                        "type": "image_url",
+                                        "image_url": { "url": data_uri }
+                                    }));
+                                }
+                                _ => {
+                                    log::error!(
+                                        "❌ Base64 document is missing media_type or data — dropping document block."
+                                    );
+                                    oai_content_blocks.push(json!({
+                                        "type": "text",
+                                        "text": "[Unsupported document: missing media_type or data]"
+                                    }));
+                                }
+                            }
+                        } else {
+                            let location_hint = source
+                                .url
+                                .as_deref()
+                                .or(source.file_id.as_deref())
+                                .unwrap_or("unknown");
+                            log::error!(
+                                "❌ Unsupported document source type '{}' (source={}) — only 'base64' is supported. Dropping document block.",
+                                source.source_type,
+                                location_hint,
+                            );
+                            oai_content_blocks.push(json!({
+                                "type": "text",
+                                "text": format!("[Unsupported document: source_type={}, media_type={}]",
+                                    source.source_type, media_type)
+                            }));
+                        }
+                    }
                     _ => {}
                 }
             }
 
-            let content = if has_images {
+            let content = if has_multimodal {
                 json!(oai_content_blocks)
             } else {
                 let text = oai_content_blocks
@@ -403,8 +685,13 @@ pub async fn messages(
     if let Some(last_msg) = msgs.last() {
         let last_is_empty_assistant = last_msg.role == "assistant"
             && (last_msg.content.is_null()
-                || (last_msg.content.is_string() && last_msg.content.as_str().unwrap_or("").is_empty()))
-            && last_msg.tool_calls.as_ref().map(|v| v.is_empty()).unwrap_or(true);
+                || (last_msg.content.is_string()
+                    && last_msg.content.as_str().unwrap_or("").is_empty()))
+            && last_msg
+                .tool_calls
+                .as_ref()
+                .map(|v| v.is_empty())
+                .unwrap_or(true);
 
         if last_is_empty_assistant {
             log::info!("🚮 Removing empty assistant placeholder message from client history.");
@@ -415,7 +702,13 @@ pub async fn messages(
 
     if msgs.is_empty() {
         log::error!("❌ No messages remaining after conversion!");
-        return Err((StatusCode::BAD_REQUEST, "no_messages"));
+        return maybe_error_response(
+            client_wants_stream,
+            StatusCode::BAD_REQUEST,
+            "no_messages",
+            "invalid_request_error",
+            "no usable messages remained after request normalization",
+        );
     }
 
     let tools = build_oai_tools(cr.tools);
@@ -432,7 +725,7 @@ pub async fn messages(
         s
     });
 
-    // Preserve your behavior: always stream SSE to backend
+    // Mirror the client's stream preference to the backend.
     let oai = OAIChatReq {
         model: backend_model,
         messages: msgs,
@@ -447,7 +740,7 @@ pub async fn messages(
         thinking: thinking_config.map(|tc| serde_json::to_value(tc).unwrap_or(Value::Null)),
         parallel_tool_calls,
         metadata: cr.metadata,
-        stream: true,
+        stream: client_wants_stream,
     };
 
     let mut req = app
@@ -459,13 +752,25 @@ pub async fn messages(
     if let Some(key) = &client_key {
         if key.contains("sk-ant-") {
             log::warn!("❌ Anthropic OAuth tokens (sk-ant-*) are not supported - use backend-compatible key (cpk_*)");
-            return Err((StatusCode::UNAUTHORIZED, "invalid_auth_token"));
+            return maybe_error_response(
+                client_wants_stream,
+                StatusCode::UNAUTHORIZED,
+                "invalid_auth_token",
+                "authentication_error",
+                "Anthropic OAuth tokens are not supported; use a backend-compatible API key",
+            );
         }
         req = req.bearer_auth(key);
         log::info!("🔄 Auth: Forwarding client key to backend");
     } else {
         log::warn!("❌ No client API key provided");
-        return Err((StatusCode::UNAUTHORIZED, "missing_api_key"));
+        return maybe_error_response(
+            client_wants_stream,
+            StatusCode::UNAUTHORIZED,
+            "missing_api_key",
+            "authentication_error",
+            "missing API key",
+        );
     }
 
     // Debug request body (image data truncated)
@@ -505,24 +810,39 @@ pub async fn messages(
         }
     }
 
-    log::debug!("🚀 Sending request to backend with {} messages", oai.messages.len());
-    let res = req.json(&oai).send().await.map_err(|e| {
-        log::error!("❌ Backend connection failed: {}", e);
-        // Record circuit breaker failure
-        tokio::spawn({
-            let cb = app.circuit_breaker.clone();
-            async move {
-                cb.write().await.record_failure();
+    log::debug!(
+        "🚀 Sending request to backend with {} messages",
+        oai.messages.len()
+    );
+    let res = match req.json(&oai).send().await {
+        Ok(res) => res,
+        Err(e) => {
+            log::error!("❌ Backend connection failed: {}", e);
+            tokio::spawn({
+                let cb = app.circuit_breaker.clone();
+                async move {
+                    cb.write().await.record_failure();
+                }
+            });
+
+            if client_wants_stream {
+                return Err((StatusCode::BAD_GATEWAY, "backend_unavailable"));
             }
-        });
-        (StatusCode::BAD_GATEWAY, "backend_unavailable")
-    })?;
+
+            return Ok(build_error_json_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "Failed to connect to the configured backend",
+            ));
+        }
+    };
 
     let status = res.status();
     log::debug!("📥 Backend response status: {}", status);
 
     // Validate Content-Type for better error messages
-    let content_type = res.headers()
+    let content_type = res
+        .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
@@ -532,8 +852,12 @@ pub async fn messages(
     if !content_type.is_empty()
         && !content_type.contains("text/event-stream")
         && !content_type.contains("application/json")
-        && !content_type.contains("application/octet-stream") {
-        log::warn!("⚠️  Unexpected Content-Type: {} (expected text/event-stream or application/json)", content_type);
+        && !content_type.contains("application/octet-stream")
+    {
+        log::warn!(
+            "⚠️  Unexpected Content-Type: {} (expected text/event-stream or application/json)",
+            content_type
+        );
     }
 
     if !status.is_success() {
@@ -546,7 +870,10 @@ pub async fn messages(
         });
 
         // Read error response body
-        let error_body = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        let error_body = res
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
 
         log::error!(
             "❌ Backend returned error: {} {} - {}",
@@ -559,153 +886,201 @@ pub async fn messages(
         if status == StatusCode::NOT_FOUND {
             let models = get_available_models(&app).await;
             if !models.is_empty() {
-                log::info!("💡 Model '{}' not found - sending model list to user", backend_model_for_error);
+                log::info!(
+                    "💡 Model '{}' not found - sending model list to user",
+                    backend_model_for_error
+                );
+                let content = build_model_list_content(&backend_model_for_error, &models);
 
-                let (tx, rx) = tokio::sync::mpsc::channel::<Event>(SSE_CHANNEL_BUFFER_SIZE);
-                let requested_model = backend_model_for_error.clone();
-                let model_name_for_response = backend_model_for_error.clone();
-                let models_for_task = models.clone();
-
-                tokio::spawn(async move {
-                    log::debug!(
-                        "🎬 Synthetic 404 response task started for model: {}",
-                        requested_model
-                    );
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-
-                    let message_obj = serde_json::json!({
-                        "id": format!("msg_{}", now),
-                        "type": "message",
-                        "role": "assistant",
-                        "content": serde_json::json!([]),  // Explicitly create empty array
-                        "model": model_name_for_response,
-                        "stop_reason": Value::Null,
-                        "stop_sequence": Value::Null,
-                        "usage": { "input_tokens": input_token_count, "output_tokens": 0 }
+                if client_wants_stream {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(SSE_CHANNEL_BUFFER_SIZE);
+                    let model_name = backend_model_for_error.clone();
+                    tokio::spawn(async move {
+                        crate::services::send_synthetic_text_response(
+                            &tx,
+                            &model_name,
+                            &content,
+                            "end_turn",
+                            input_token_count,
+                            50,
+                        )
+                        .await;
                     });
-                    let start = json!({
-                        "type": "message_start",
-                        "message": message_obj
-                    });
-                    let _ = tx.send(Event::default().event("message_start").data(start.to_string())).await;
-
-                    let block_start = json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": { "type": "text", "text": "" }
-                    });
-                    let _ = tx.send(Event::default().event("content_block_start").data(block_start.to_string())).await;
-
-                    let content = build_model_list_content(&requested_model, &models_for_task);
-
-                    let delta = json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": { "type": "text_delta", "text": content }
-                    });
-                    let _ = tx.send(Event::default().event("content_block_delta").data(delta.to_string())).await;
-
-                    let block_stop = json!({ "type": "content_block_stop", "index": 0 });
-                    let _ = tx.send(Event::default().event("content_block_stop").data(block_stop.to_string())).await;
-
-                    let msg_delta = json!({
-                        "type": "message_delta",
-                        "delta": { "stop_reason": "end_turn", "stop_sequence": Value::Null },
-                        "usage": { "output_tokens": 50 }
-                    });
-                    let _ = tx.send(Event::default().event("message_delta").data(msg_delta.to_string())).await;
-
-                    let msg_stop = json!({ "type": "message_stop" });
-                    let _ = tx.send(Event::default().event("message_stop").data(msg_stop.to_string())).await;
-                    log::debug!("🏁 Synthetic 404 response completed");
-                });
-
-                let mut headers = HeaderMap::new();
-                headers.insert("cache-control", "no-cache".parse().unwrap());
-                headers.insert("connection", "keep-alive".parse().unwrap());
-                headers.insert("x-accel-buffering", "no".parse().unwrap());
-                let stream = ReceiverStream::new(rx).map(Ok::<Event, Infallible>);
-                return Ok((headers, Sse::new(stream)));
+                    return Ok(into_sse_response(rx));
+                } else {
+                    return Ok(build_non_streaming_response(
+                        &backend_model_for_error,
+                        vec![json!({"type": "text", "text": content})],
+                        "end_turn",
+                        input_token_count,
+                        50,
+                    ));
+                }
             }
         }
 
         // For retryable errors (rate limits, server errors), pass through HTTP status
         // so Claude Code can retry automatically
-        if matches!(status,
+        if matches!(
+            status,
             StatusCode::TOO_MANY_REQUESTS |  // 429
             StatusCode::INTERNAL_SERVER_ERROR |  // 500
             StatusCode::BAD_GATEWAY |  // 502
             StatusCode::SERVICE_UNAVAILABLE |  // 503
-            StatusCode::GATEWAY_TIMEOUT  // 504
+            StatusCode::GATEWAY_TIMEOUT // 504
         ) {
-            log::info!("⚠️  Returning retryable error status {} for automatic retry", status);
-            return Err((status, "backend_error_retryable"));
+            log::info!(
+                "⚠️  Returning retryable error status {} for automatic retry",
+                status
+            );
+            if client_wants_stream {
+                return Err((status, "backend_error_retryable"));
+            }
+
+            let message = extract_backend_error_message(&error_body);
+            return Ok(build_error_json_response(
+                status,
+                anthropic_error_type(status),
+                &message,
+            ));
         }
 
-        // For non-retryable errors (auth, bad request), return formatted SSE message
-        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
-        let error_msg = format_backend_error(&error_body, &error_body);
         let model_name = backend_model_for_error.clone();
 
-        tokio::spawn(async move {
-            log::debug!("🎬 Synthetic error response task started");
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-
-            let message_obj = serde_json::json!({
-                "id": format!("msg_{}", now),
-                "type": "message",
-                "role": "assistant",
-                "content": serde_json::json!([]),  // Explicitly create empty array
-                "model": model_name,
-                "stop_reason": Value::Null,
-                "stop_sequence": Value::Null,
-                "usage": { "input_tokens": input_token_count, "output_tokens": 0 }
+        if client_wants_stream {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
+            let error_msg = format_backend_error(&error_body, &error_body);
+            tokio::spawn(async move {
+                crate::services::send_synthetic_text_response(
+                    &tx,
+                    &model_name,
+                    &error_msg,
+                    "error",
+                    input_token_count,
+                    0,
+                )
+                .await;
             });
-            let start = json!({
-                "type": "message_start",
-                "message": message_obj
-            });
-            let _ = tx.send(Event::default().event("message_start").data(start.to_string())).await;
-
-            let block_start = json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": { "type": "text", "text": "" }
-            });
-            let _ = tx.send(Event::default().event("content_block_start").data(block_start.to_string())).await;
-
-            let delta = json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": { "type": "text_delta", "text": error_msg }
-            });
-            let _ = tx.send(Event::default().event("content_block_delta").data(delta.to_string())).await;
-
-            let block_stop = json!({ "type": "content_block_stop", "index": 0 });
-            let _ = tx.send(Event::default().event("content_block_stop").data(block_stop.to_string())).await;
-
-            let msg_delta = json!({
-                "type": "message_delta",
-                "delta": { "stop_reason": "error", "stop_sequence": Value::Null },
-                "usage": { "output_tokens": 0 }
-            });
-            let _ = tx.send(Event::default().event("message_delta").data(msg_delta.to_string())).await;
-
-            let msg_stop = json!({ "type": "message_stop" });
-            let _ = tx.send(Event::default().event("message_stop").data(msg_stop.to_string())).await;
-            log::debug!("🏁 Synthetic error response completed");
-        });
-
-        let mut headers = HeaderMap::new();
-        headers.insert("cache-control", "no-cache".parse().unwrap());
-        headers.insert("connection", "keep-alive".parse().unwrap());
-        headers.insert("x-accel-buffering", "no".parse().unwrap());
-        let stream = ReceiverStream::new(rx).map(Ok::<Event, Infallible>);
-        return Ok((headers, Sse::new(stream)));
+            return Ok(into_sse_response(rx));
+        } else {
+            let message = extract_backend_error_message(&error_body);
+            return Ok(build_error_json_response(
+                status,
+                anthropic_error_type(status),
+                &message,
+            ));
+        }
     }
 
     log::info!("✅ Backend responded successfully ({})", status);
 
+    // ── Non-streaming path ──────────────────────────────────────────────
+    if !client_wants_stream {
+        // Backend returned a complete JSON response (stream: false).
+        // Parse the OAI chat completion and translate to Claude Messages format.
+        let body: Value = match res.json().await {
+            Ok(body) => body,
+            Err(e) => {
+                log::error!("❌ Failed to parse non-streaming backend response: {}", e);
+                return Ok(build_error_json_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "Failed to parse backend response",
+                ));
+            }
+        };
+
+        let model_name = body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or(&oai.model);
+
+        let choice = body
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first());
+
+        let message = choice.and_then(|c| c.get("message"));
+        let finish_reason = choice
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|r| r.as_str());
+        let stop_reason = translate_finish_reason(finish_reason);
+
+        let mut content_blocks: Vec<Value> = Vec::new();
+
+        // Extract reasoning_content → thinking block
+        if let Some(reasoning) = message
+            .and_then(|m| m.get("reasoning_content"))
+            .and_then(|r| r.as_str())
+        {
+            if !reasoning.is_empty() {
+                content_blocks.push(json!({
+                    "type": "thinking",
+                    "thinking": reasoning
+                }));
+            }
+        }
+
+        append_non_stream_text_content(&mut content_blocks, message.and_then(|m| m.get("content")));
+
+        // Extract tool_calls → tool_use blocks
+        if let Some(tool_calls) = message
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|t| t.as_array())
+        {
+            for tc in tool_calls {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let func = tc.get("function");
+                let name = func
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let args_str = func
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("{}");
+                let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                content_blocks.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": input
+                }));
+            }
+        }
+
+        // If no content at all, add empty text block
+        if content_blocks.is_empty() {
+            content_blocks.push(json!({"type": "text", "text": ""}));
+        }
+
+        // Extract usage
+        let usage = body.get("usage");
+        let prompt_tokens = usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(input_token_count as u64) as u32;
+        let completion_tokens = usage
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0) as u32;
+
+        // Record circuit breaker success
+        {
+            let mut cb = app.circuit_breaker.write().await;
+            cb.record_success();
+        }
+
+        return Ok(build_non_streaming_response(
+            model_name,
+            content_blocks,
+            stop_reason,
+            prompt_tokens,
+            completion_tokens,
+        ));
+    }
+
+    // ── Streaming path ──────────────────────────────────────────────────
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
 
     // Per-request ephemeral state for re-chunking.
@@ -715,7 +1090,10 @@ pub async fn messages(
         log::debug!("🎬 Streaming task started");
 
         // Emit Claude "message_start" - ensure content is always an array
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let message_obj = serde_json::json!({
             "id": format!("msg_{now}"),
             "type": "message",
@@ -736,8 +1114,27 @@ pub async fn messages(
         });
 
         // If we can't send message_start, client is gone - no point continuing
-        if tx.send(Event::default().event("message_start").data(start.to_string())).await.is_err() {
+        if tx
+            .send(
+                Event::default()
+                    .event("message_start")
+                    .data(start.to_string()),
+            )
+            .await
+            .is_err()
+        {
             log::debug!("🔌 Client disconnected before message_start - aborting stream");
+            return;
+        }
+
+        // Emit ping event per Anthropic SSE spec (keeps connection alive, signals stream health)
+        let ping = json!({"type": "ping"});
+        if tx
+            .send(Event::default().event("ping").data(ping.to_string()))
+            .await
+            .is_err()
+        {
+            log::debug!("🔌 Client disconnected before ping");
             return;
         }
 
@@ -759,6 +1156,7 @@ pub async fn messages(
 
         // Track output tokens
         let mut output_token_count: u32 = 0;
+        let mut backend_reported_usage = false;
 
         log::debug!("🌊 Begin processing SSE from backend");
         while let Some(item) = bytes_stream.next().await {
@@ -795,23 +1193,39 @@ pub async fn messages(
                         if let Ok(val) = json_value {
                             // Check if it's an error response
                             if let Some(error_obj) = val.get("error") {
-                                let error_msg = error_obj.get("message")
+                                let error_msg = error_obj
+                                    .get("message")
                                     .or_else(|| error_obj.get("type"))
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("Unknown error");
                                 let error_details = if error_msg.is_empty() {
-                                    serde_json::to_string(error_obj).unwrap_or_else(|_| "Unknown backend error".into())
+                                    serde_json::to_string(error_obj)
+                                        .unwrap_or_else(|_| "Unknown backend error".into())
                                 } else {
                                     error_msg.to_string()
                                 };
 
-                                log::warn!("⚠️  Backend returned error in chunk: {}", error_details);
+                                log::warn!(
+                                    "⚠️  Backend returned error in chunk: {}",
+                                    error_details
+                                );
 
                                 // Close any open text block before emitting the error
                                 if text_open {
-                                    let stop = json!({"type":"content_block_stop","index":text_index});
-                                    if tx.send(Event::default().event("content_block_stop").data(stop.to_string())).await.is_err() {
-                                        log::debug!("🔌 Client disconnected during error block close");
+                                    let stop =
+                                        json!({"type":"content_block_stop","index":text_index});
+                                    if tx
+                                        .send(
+                                            Event::default()
+                                                .event("content_block_stop")
+                                                .data(stop.to_string()),
+                                        )
+                                        .await
+                                        .is_err()
+                                    {
+                                        log::debug!(
+                                            "🔌 Client disconnected during error block close"
+                                        );
                                         break;
                                     }
                                     text_open = false;
@@ -826,7 +1240,15 @@ pub async fn messages(
                                     "index":error_index,
                                     "content_block":{"type":"text","text":""}
                                 });
-                                if tx.send(Event::default().event("content_block_start").data(start.to_string())).await.is_err() {
+                                if tx
+                                    .send(
+                                        Event::default()
+                                            .event("content_block_start")
+                                            .data(start.to_string()),
+                                    )
+                                    .await
+                                    .is_err()
+                                {
                                     log::debug!("🔌 Client disconnected during error start");
                                     break;
                                 }
@@ -839,7 +1261,15 @@ pub async fn messages(
                                     "index":error_index,
                                     "delta":{"type":"text_delta","text":formatted_error}
                                 });
-                                if tx.send(Event::default().event("content_block_delta").data(delta.to_string())).await.is_err() {
+                                if tx
+                                    .send(
+                                        Event::default()
+                                            .event("content_block_delta")
+                                            .data(delta.to_string()),
+                                    )
+                                    .await
+                                    .is_err()
+                                {
                                     log::debug!("🔌 Client disconnected during error delta");
                                     break;
                                 }
@@ -849,7 +1279,11 @@ pub async fn messages(
                                     "index":error_index
                                 });
                                 let _ = tx
-                                    .send(Event::default().event("content_block_stop").data(stop.to_string()))
+                                    .send(
+                                        Event::default()
+                                            .event("content_block_stop")
+                                            .data(stop.to_string()),
+                                    )
                                     .await;
 
                                 final_stop_reason = "error";
@@ -865,7 +1299,11 @@ pub async fn messages(
                                 } else {
                                     data.to_string()
                                 };
-                                log::warn!("⚠️  Chunk missing 'choices' field ({} chars), structure: {}", data.len(), preview);
+                                log::warn!(
+                                    "⚠️  Chunk missing 'choices' field ({} chars), structure: {}",
+                                    data.len(),
+                                    preview
+                                );
                                 continue;
                             }
                         }
@@ -876,7 +1314,12 @@ pub async fn messages(
                         } else {
                             data.to_string()
                         };
-                        log::warn!("⚠️  JSON parse failed ({} chars): {}\nResponse preview: {}", data.len(), e, preview);
+                        log::warn!(
+                            "⚠️  JSON parse failed ({} chars): {}\nResponse preview: {}",
+                            data.len(),
+                            e,
+                            preview
+                        );
                         continue;
                     }
                 };
@@ -889,7 +1332,8 @@ pub async fn messages(
                         .and_then(|v| v.as_str())
                         .unwrap_or("Unknown error");
                     let error_details = if error_msg.is_empty() {
-                        serde_json::to_string(error_val).unwrap_or_else(|_| "Unknown backend error".into())
+                        serde_json::to_string(error_val)
+                            .unwrap_or_else(|_| "Unknown backend error".into())
                     } else {
                         error_msg.to_string()
                     };
@@ -899,7 +1343,15 @@ pub async fn messages(
                     // Close any open text block before emitting the error
                     if text_open {
                         let stop = json!({"type":"content_block_stop","index":text_index});
-                        if tx.send(Event::default().event("content_block_stop").data(stop.to_string())).await.is_err() {
+                        if tx
+                            .send(
+                                Event::default()
+                                    .event("content_block_stop")
+                                    .data(stop.to_string()),
+                            )
+                            .await
+                            .is_err()
+                        {
                             log::debug!("🔌 Client disconnected during chunk error block close");
                             break;
                         }
@@ -915,20 +1367,36 @@ pub async fn messages(
                         "index":error_index,
                         "content_block":{"type":"text","text":""}
                     });
-                    if tx.send(Event::default().event("content_block_start").data(start.to_string())).await.is_err() {
+                    if tx
+                        .send(
+                            Event::default()
+                                .event("content_block_start")
+                                .data(start.to_string()),
+                        )
+                        .await
+                        .is_err()
+                    {
                         log::debug!("🔌 Client disconnected during chunk error start");
                         break;
                     }
 
-                                // Format structured error message
-                                let formatted_error = format_backend_error(&error_details, data);
+                    // Format structured error message
+                    let formatted_error = format_backend_error(&error_details, data);
 
-                                let delta = json!({
-                                    "type":"content_block_delta",
-                                    "index":error_index,
-                                    "delta":{"type":"text_delta","text":formatted_error}
-                                });
-                    if tx.send(Event::default().event("content_block_delta").data(delta.to_string())).await.is_err() {
+                    let delta = json!({
+                        "type":"content_block_delta",
+                        "index":error_index,
+                        "delta":{"type":"text_delta","text":formatted_error}
+                    });
+                    if tx
+                        .send(
+                            Event::default()
+                                .event("content_block_delta")
+                                .data(delta.to_string()),
+                        )
+                        .await
+                        .is_err()
+                    {
                         log::debug!("🔌 Client disconnected during chunk error delta");
                         break;
                     }
@@ -938,7 +1406,11 @@ pub async fn messages(
                         "index":error_index
                     });
                     let _ = tx
-                        .send(Event::default().event("content_block_stop").data(stop.to_string()))
+                        .send(
+                            Event::default()
+                                .event("content_block_stop")
+                                .data(stop.to_string()),
+                        )
                         .await;
 
                     final_stop_reason = "error";
@@ -957,7 +1429,11 @@ pub async fn messages(
                 // Capture finish_reason if provided
                 if let Some(reason) = &choice.finish_reason {
                     final_stop_reason = translate_finish_reason(Some(reason));
-                    log::debug!("📍 Backend finish_reason: {} → Claude stop_reason: {}", reason, final_stop_reason);
+                    log::debug!(
+                        "📍 Backend finish_reason: {} → Claude stop_reason: {}",
+                        reason,
+                        final_stop_reason
+                    );
                 }
 
                 // Handle non-streaming complete response (fallback)
@@ -972,7 +1448,11 @@ pub async fn messages(
                                 "content_block":{"type":"text","text":""}
                             });
                             let _ = tx
-                                .send(Event::default().event("content_block_start").data(ev.to_string()))
+                                .send(
+                                    Event::default()
+                                        .event("content_block_start")
+                                        .data(ev.to_string()),
+                                )
                                 .await;
                             text_open = true;
                         }
@@ -982,7 +1462,11 @@ pub async fn messages(
                             "delta":{"type":"text_delta","text":content_str}
                         });
                         let _ = tx
-                            .send(Event::default().event("content_block_delta").data(ev.to_string()))
+                            .send(
+                                Event::default()
+                                    .event("content_block_delta")
+                                    .data(ev.to_string()),
+                            )
                             .await;
                     }
                     continue;
@@ -999,15 +1483,14 @@ pub async fn messages(
                     if let Some(prompt_tokens) = usage.prompt_tokens {
                         log::debug!("📊 Backend reported prompt tokens: {}", prompt_tokens);
                     }
-                    if let Some(total_tokens) = usage.total_tokens {
-                        // total_tokens is most accurate - always prefer it
-                        output_token_count = total_tokens;
-                        log::debug!("📊 Backend reported total tokens: {}", total_tokens);
-                    } else if let Some(completion_tokens) = usage.completion_tokens {
-                        // Use completion_tokens as fallback if total_tokens not available
-                        // This is more accurate than our streaming approximation
+                    if let Some(completion_tokens) = usage.completion_tokens {
+                        // Backend-reported tokens are authoritative; replace any streaming approximation
                         output_token_count = completion_tokens;
-                        log::debug!("📊 Backend reported completion tokens: {}", completion_tokens);
+                        backend_reported_usage = true;
+                        log::debug!(
+                            "📊 Backend reported completion tokens: {}",
+                            completion_tokens
+                        );
                     }
                 }
 
@@ -1023,10 +1506,17 @@ pub async fn messages(
                                 "content_block":{"type":"thinking","thinking":""}
                             });
                             let _ = tx
-                                .send(Event::default().event("content_block_start").data(ev.to_string()))
+                                .send(
+                                    Event::default()
+                                        .event("content_block_start")
+                                        .data(ev.to_string()),
+                                )
                                 .await;
                             thinking_open = true;
-                            log::info!("🧠 OUTPUT: Opened thinking block (index={})", thinking_index);
+                            log::info!(
+                                "🧠 OUTPUT: Opened thinking block (index={})",
+                                thinking_index
+                            );
                         }
                         let ev = json!({
                             "type":"content_block_delta",
@@ -1034,13 +1524,20 @@ pub async fn messages(
                             "delta":{"type":"thinking_delta","thinking":r}
                         });
                         let _ = tx
-                            .send(Event::default().event("content_block_delta").data(ev.to_string()))
+                            .send(
+                                Event::default()
+                                    .event("content_block_delta")
+                                    .data(ev.to_string()),
+                            )
                             .await;
                         log::debug!("🧠 OUTPUT: Streamed thinking delta ({} chars)", r.len());
 
-                        // Count reasoning tokens (approximate)
-                        let reasoning_tokens = std::cmp::max(1, r.len() / CHARS_PER_TOKEN) as u32;
-                        output_token_count += reasoning_tokens;
+                        // Approximate token count only if backend hasn't reported usage
+                        if !backend_reported_usage {
+                            let reasoning_tokens =
+                                std::cmp::max(1, r.len() / CHARS_PER_TOKEN) as u32;
+                            output_token_count += reasoning_tokens;
+                        }
                     }
                 }
 
@@ -1051,10 +1548,17 @@ pub async fn messages(
                         if thinking_open {
                             let ev = json!({ "type":"content_block_stop", "index":thinking_index });
                             let _ = tx
-                                .send(Event::default().event("content_block_stop").data(ev.to_string()))
+                                .send(
+                                    Event::default()
+                                        .event("content_block_stop")
+                                        .data(ev.to_string()),
+                                )
                                 .await;
                             thinking_open = false;
-                            log::info!("🧠 OUTPUT: Closed thinking block before text (index={})", thinking_index);
+                            log::info!(
+                                "🧠 OUTPUT: Closed thinking block before text (index={})",
+                                thinking_index
+                            );
                         }
 
                         if !text_open {
@@ -1066,7 +1570,11 @@ pub async fn messages(
                                 "content_block":{"type":"text","text":""}
                             });
                             let _ = tx
-                                .send(Event::default().event("content_block_start").data(ev.to_string()))
+                                .send(
+                                    Event::default()
+                                        .event("content_block_start")
+                                        .data(ev.to_string()),
+                                )
                                 .await;
                             text_open = true;
                         }
@@ -1076,12 +1584,18 @@ pub async fn messages(
                             "delta":{"type":"text_delta","text":c}
                         });
                         let _ = tx
-                            .send(Event::default().event("content_block_delta").data(ev.to_string()))
+                            .send(
+                                Event::default()
+                                    .event("content_block_delta")
+                                    .data(ev.to_string()),
+                            )
                             .await;
 
-                        // Count text tokens (approximate)
-                        let text_tokens = std::cmp::max(1, c.len() / CHARS_PER_TOKEN) as u32;
-                        output_token_count += text_tokens;
+                        // Approximate token count only if backend hasn't reported usage
+                        if !backend_reported_usage {
+                            let text_tokens = std::cmp::max(1, c.len() / CHARS_PER_TOKEN) as u32;
+                            output_token_count += text_tokens;
+                        }
                     }
                 }
 
@@ -1092,23 +1606,25 @@ pub async fn messages(
                         if text_open {
                             let ev = json!({"type":"content_block_stop","index":text_index});
                             let _ = tx
-                                .send(Event::default().event("content_block_stop").data(ev.to_string()))
+                                .send(
+                                    Event::default()
+                                        .event("content_block_stop")
+                                        .data(ev.to_string()),
+                                )
                                 .await;
                             text_open = false;
                         }
 
                         for tc in tool_calls {
                             let idx = tc.index.unwrap_or(0);
-                            
+
                             // Initialize tool buffer if not present
-                            let tb = tools.entry(idx).or_insert_with(|| {
-                                ToolBuf {
-                                    block_index: next_block_index,
-                                    id: None,
-                                    name: None,
-                                    pending_args: String::new(),
-                                    has_sent_start: false,
-                                }
+                            let tb = tools.entry(idx).or_insert_with(|| ToolBuf {
+                                block_index: next_block_index,
+                                id: None,
+                                name: None,
+                                pending_args: String::new(),
+                                has_sent_start: false,
                             });
 
                             // Update fields from delta
@@ -1120,33 +1636,53 @@ pub async fn messages(
                             }
 
                             // Capture arguments in buffer first
-                            if let Some(args) = tc.function.as_ref().and_then(|f| f.arguments.clone()) {
+                            if let Some(args) =
+                                tc.function.as_ref().and_then(|f| f.arguments.clone())
+                            {
                                 tb.pending_args.push_str(&args);
                             }
 
                             // Check if we can start the block (need ID and Name)
                             // Only increment next_block_index ONCE when we actually start the block
-                            if !tb.has_sent_start && tb.id.is_some() && tb.name.is_some() {
+                            if !tb.has_sent_start {
+                                let (Some(tool_id), Some(tool_name)) =
+                                    (tb.id.as_ref(), tb.name.as_ref())
+                                else {
+                                    continue;
+                                };
+
                                 // Assign the block index now
                                 tb.block_index = next_block_index;
                                 next_block_index += 1;
-                                
+
                                 let start = json!({
                                     "type":"content_block_start",
                                     "index":tb.block_index,
                                     "content_block":{
                                         "type":"tool_use",
-                                        "id":tb.id.as_ref().unwrap(),
-                                        "name":tb.name.as_ref().unwrap(),
+                                        "id":tool_id,
+                                        "name":tool_name,
                                         "input":{}
                                     }
                                 });
-                                if tx.send(Event::default().event("content_block_start").data(start.to_string())).await.is_err() {
+                                if tx
+                                    .send(
+                                        Event::default()
+                                            .event("content_block_start")
+                                            .data(start.to_string()),
+                                    )
+                                    .await
+                                    .is_err()
+                                {
                                     log::debug!("🔌 Client disconnected during tool start");
                                     break;
                                 }
                                 tb.has_sent_start = true;
-                                log::info!("🔧 Tool call started: id={}, name={}", tb.id.as_ref().unwrap(), tb.name.as_ref().unwrap());
+                                log::info!(
+                                    "🔧 Tool call started: id={}, name={}",
+                                    tool_id,
+                                    tool_name
+                                );
                             }
 
                             // If started, flush pending args and stream
@@ -1156,7 +1692,15 @@ pub async fn messages(
                                     "index": tb.block_index,
                                     "delta":{"type":"input_json_delta","partial_json": tb.pending_args}
                                 });
-                                if tx.send(Event::default().event("content_block_delta").data(ev.to_string())).await.is_err() {
+                                if tx
+                                    .send(
+                                        Event::default()
+                                            .event("content_block_delta")
+                                            .data(ev.to_string()),
+                                    )
+                                    .await
+                                    .is_err()
+                                {
                                     log::debug!("🔌 Client disconnected during tool args");
                                     break;
                                 }
@@ -1182,7 +1726,12 @@ pub async fn messages(
                 let data = payload.trim();
                 if data != "[DONE]" && !data.is_empty() {
                     if let Ok(chunk) = serde_json::from_str::<OAIStreamChunk>(data) {
-                        if let Some(c) = chunk.choices.get(0).and_then(|ch| ch.delta.as_ref()).and_then(|d| d.content.as_ref()) {
+                        if let Some(c) = chunk
+                            .choices
+                            .first()
+                            .and_then(|ch| ch.delta.as_ref())
+                            .and_then(|d| d.content.as_ref())
+                        {
                             if !c.is_empty() {
                                 if !text_open {
                                     text_index = next_block_index;
@@ -1192,7 +1741,11 @@ pub async fn messages(
                                         "content_block":{"type":"text","text":""}
                                     });
                                     let _ = tx
-                                        .send(Event::default().event("content_block_start").data(ev.to_string()))
+                                        .send(
+                                            Event::default()
+                                                .event("content_block_start")
+                                                .data(ev.to_string()),
+                                        )
                                         .await;
                                     text_open = true;
                                 }
@@ -1202,7 +1755,11 @@ pub async fn messages(
                                     "delta":{"type":"text_delta","text":c}
                                 });
                                 let _ = tx
-                                    .send(Event::default().event("content_block_delta").data(ev.to_string()))
+                                    .send(
+                                        Event::default()
+                                            .event("content_block_delta")
+                                            .data(ev.to_string()),
+                                    )
                                     .await;
                             }
                         }
@@ -1215,20 +1772,35 @@ pub async fn messages(
         if thinking_open {
             let ev = json!({ "type":"content_block_stop", "index":thinking_index });
             let _ = tx
-                .send(Event::default().event("content_block_stop").data(ev.to_string()))
+                .send(
+                    Event::default()
+                        .event("content_block_stop")
+                        .data(ev.to_string()),
+                )
                 .await;
-            log::info!("🧠 OUTPUT: Closed thinking block at end (index={})", thinking_index);
+            log::info!(
+                "🧠 OUTPUT: Closed thinking block at end (index={})",
+                thinking_index
+            );
         }
         if text_open {
             let ev = json!({ "type":"content_block_stop", "index":text_index });
             let _ = tx
-                .send(Event::default().event("content_block_stop").data(ev.to_string()))
+                .send(
+                    Event::default()
+                        .event("content_block_stop")
+                        .data(ev.to_string()),
+                )
                 .await;
         }
         for tb in tools.values() {
             let stop = json!({ "type":"content_block_stop", "index":tb.block_index });
             let _ = tx
-                .send(Event::default().event("content_block_stop").data(stop.to_string()))
+                .send(
+                    Event::default()
+                        .event("content_block_stop")
+                        .data(stop.to_string()),
+                )
                 .await;
         }
 
@@ -1238,12 +1810,24 @@ pub async fn messages(
             "usage":{"output_tokens":output_token_count}
         });
         // Critical: if these final events fail, stream is incomplete - but log it
-        if tx.send(Event::default().event("message_delta").data(md.to_string())).await.is_err() {
+        if tx
+            .send(Event::default().event("message_delta").data(md.to_string()))
+            .await
+            .is_err()
+        {
             log::debug!("🔌 Client disconnected before message_delta");
             return;
         }
 
-        if tx.send(Event::default().event("message_stop").data(json!({"type":"message_stop"}).to_string())).await.is_err() {
+        if tx
+            .send(
+                Event::default()
+                    .event("message_stop")
+                    .data(json!({"type":"message_stop"}).to_string()),
+            )
+            .await
+            .is_err()
+        {
             log::debug!("🔌 Client disconnected before message_stop");
             return;
         }
@@ -1260,7 +1844,10 @@ pub async fn messages(
             }
         }
         if drained_bytes > 0 {
-            log::debug!("🔄 Drained {} additional bytes from backend stream", drained_bytes);
+            log::debug!(
+                "🔄 Drained {} additional bytes from backend stream",
+                drained_bytes
+            );
         } else {
             log::debug!("✅ Backend stream was already fully consumed");
         }
@@ -1274,13 +1861,6 @@ pub async fn messages(
         }
     });
 
-    let mut out_headers = HeaderMap::new();
-    out_headers.insert("cache-control", "no-cache".parse().unwrap());
-    out_headers.insert("connection", "keep-alive".parse().unwrap());
-    out_headers.insert("x-accel-buffering", "no".parse().unwrap());
-
-    let stream = ReceiverStream::new(rx).map(Ok::<Event, Infallible>);
-
     // Log structured metrics
     if let Ok(elapsed) = request_start.elapsed() {
         log::info!(target: "metrics",
@@ -1289,5 +1869,49 @@ pub async fn messages(
         );
     }
 
-    Ok((out_headers, Sse::new(stream)))
+    Ok(into_sse_response(rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_content_uses_cache_control_detects_block_marker() {
+        assert!(content_uses_cache_control(&json!([
+            {"type": "text", "text": "cached", "cache_control": {"type": "ephemeral"}}
+        ])));
+        assert!(!content_uses_cache_control(&json!([
+            {"type": "text", "text": "plain"}
+        ])));
+    }
+
+    #[test]
+    fn test_extract_backend_error_message_prefers_nested_error_message() {
+        let message = extract_backend_error_message(
+            r#"{"error":{"message":"upstream quota exceeded","type":"insufficient_quota"}}"#,
+        );
+        assert_eq!(message, "upstream quota exceeded");
+    }
+
+    #[test]
+    fn test_append_non_stream_text_content_supports_array_blocks() {
+        let mut content_blocks = Vec::new();
+        append_non_stream_text_content(
+            &mut content_blocks,
+            Some(&json!([
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"}
+            ])),
+        );
+
+        assert_eq!(
+            content_blocks,
+            vec![
+                json!({"type": "text", "text": "first"}),
+                json!({"type": "text", "text": "second"}),
+            ]
+        );
+    }
 }

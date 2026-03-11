@@ -1,4 +1,61 @@
+use crate::constants::*;
 use serde_json::{json, Value};
+
+/// Count input tokens for a Claude request using tiktoken (cl100k_base).
+/// Falls back to character-based estimation if tiktoken init fails.
+pub fn count_input_tokens(
+    messages: &[crate::models::ClaudeMessage],
+    system: &Option<Value>,
+    tools: &Option<Vec<crate::models::ClaudeTool>>,
+) -> u32 {
+    let mut text_parts = Vec::new();
+    let mut image_count = 0;
+
+    if let Some(sys) = system {
+        let sys_text = match sys {
+            Value::String(s) => s.clone(),
+            _ => serde_json::to_string(sys).unwrap_or_default(),
+        };
+        if !sys_text.is_empty() {
+            text_parts.push(sys_text);
+        }
+    }
+
+    for msg in messages {
+        let (msg_text, msg_image_count) = extract_text_from_content(&msg.content);
+        if !msg_text.is_empty() {
+            text_parts.push(format!("{}: {}", msg.role, msg_text));
+        }
+        image_count += msg_image_count;
+    }
+
+    if let Some(tools) = tools {
+        for tool in tools {
+            text_parts.push(tool.name.clone());
+            if let Some(desc) = &tool.description {
+                text_parts.push(desc.clone());
+            }
+            if let Ok(schema_str) = serde_json::to_string(&tool.input_schema) {
+                text_parts.push(schema_str);
+            }
+        }
+    }
+
+    let combined_text = text_parts.join("\n");
+
+    match tiktoken_rs::cl100k_base() {
+        Ok(encoder) => {
+            let text_tokens = encoder.encode_with_special_tokens(&combined_text).len();
+            let image_tokens = image_count * TOKENS_PER_IMAGE;
+            (text_tokens + image_tokens) as u32
+        }
+        Err(_) => {
+            let text_estimate = std::cmp::max(1, combined_text.len() / CHARS_PER_TOKEN);
+            let image_tokens = image_count * TOKENS_PER_IMAGE;
+            (text_estimate + image_tokens) as u32
+        }
+    }
+}
 
 /// Extract text content from Claude content value (string or array of blocks)
 /// Returns tuple: (text_content, image_count)
@@ -21,6 +78,11 @@ pub fn extract_text_from_content(content: &Value) -> (String, usize) {
                     Some("image") => {
                         image_count += 1;
                     }
+                    Some("document") => {
+                        // Documents are roughly equivalent to images for token estimation
+                        // A full page PDF is ~1500 tokens, but we use image constant as baseline
+                        image_count += 1;
+                    }
                     Some("tool_result") => {
                         if let Some(result_content) = obj.get("content") {
                             if let Some(text) = result_content.as_str() {
@@ -28,7 +90,9 @@ pub fn extract_text_from_content(content: &Value) -> (String, usize) {
                             } else if let Some(arr) = result_content.as_array() {
                                 for item in arr {
                                     if let Some(text_obj) = item.as_object() {
-                                        if text_obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        if text_obj.get("type").and_then(|t| t.as_str())
+                                            == Some("text")
+                                        {
                                             if let Some(text) =
                                                 text_obj.get("text").and_then(|t| t.as_str())
                                             {
@@ -108,8 +172,11 @@ pub fn serialize_tool_result_content(content: &Value) -> String {
     serde_json::to_string(content).unwrap_or_else(|_| "{}".into())
 }
 
-/// Build OpenAI tools array from Claude tools
-pub fn build_oai_tools(tools: Option<Vec<crate::models::ClaudeTool>>) -> Option<Vec<crate::models::OAITool>> {
+/// Build OpenAI tools array from Claude tools.
+/// Returns None when no tools are provided (avoids sending empty tools array to backend).
+pub fn build_oai_tools(
+    tools: Option<Vec<crate::models::ClaudeTool>>,
+) -> Option<Vec<crate::models::OAITool>> {
     match tools {
         Some(ts) if !ts.is_empty() => Some(
             ts.into_iter()
@@ -123,7 +190,7 @@ pub fn build_oai_tools(tools: Option<Vec<crate::models::ClaudeTool>>) -> Option<
                 })
                 .collect::<Vec<_>>(),
         ),
-        _ => Some(vec![]),
+        _ => None,
     }
 }
 
@@ -166,11 +233,17 @@ pub fn convert_tool_choice(tool_choice: Option<Value>) -> (Option<Value>, Option
                         .and_then(|v| v.as_str())
                         .or_else(|| obj.get("tool_name").and_then(|v| v.as_str()));
                     if let Some(name) = name {
-                        log::info!("🔧 tool_choice: forcing tool '{}' via function format", name);
-                        (Some(json!({
-                            "type": "function",
-                            "function": { "name": name }
-                        })), parallel_disabled)
+                        log::info!(
+                            "🔧 tool_choice: forcing tool '{}' via function format",
+                            name
+                        );
+                        (
+                            Some(json!({
+                                "type": "function",
+                                "function": { "name": name }
+                            })),
+                            parallel_disabled,
+                        )
                     } else {
                         log::warn!("⚠️ tool_choice 'tool' missing 'name'; dropping constraint");
                         (None, parallel_disabled)
@@ -180,8 +253,8 @@ pub fn convert_tool_choice(tool_choice: Option<Value>) -> (Option<Value>, Option
                 "auto" => (Some(Value::String("auto".into())), parallel_disabled),
                 "none" => (Some(Value::String("none".into())), parallel_disabled),
                 "any" => {
-                     log::info!("🔧 tool_choice: type 'any' → 'required'");
-                     (Some(Value::String("required".into())), parallel_disabled)
+                    log::info!("🔧 tool_choice: type 'any' → 'required'");
+                    (Some(Value::String("required".into())), parallel_disabled)
                 }
                 "required" => (Some(Value::String("required".into())), parallel_disabled),
                 other => {
@@ -283,6 +356,17 @@ mod tests {
         let (text, images) = extract_text_from_content(&content);
         assert_eq!(text, "Between images");
         assert_eq!(images, 2);
+    }
+
+    #[test]
+    fn test_extract_text_counts_document_as_multimodal_input() {
+        let content = json!([
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "ZmFrZQ=="}},
+            {"type": "text", "text": "Attached document"}
+        ]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "Attached document");
+        assert_eq!(images, 1);
     }
 
     #[test]

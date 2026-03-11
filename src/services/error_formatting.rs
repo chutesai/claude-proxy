@@ -4,9 +4,7 @@ use serde_json::Value;
 pub fn format_backend_error(error_msg: &str, raw_json: &str) -> String {
     // Try to extract model name from context if available
     let model_name = if let Ok(val) = serde_json::from_str::<Value>(raw_json) {
-        val.get("model")
-            .and_then(|m| m.as_str())
-            .map(String::from)
+        val.get("model").and_then(|m| m.as_str()).map(String::from)
     } else {
         None
     };
@@ -21,10 +19,18 @@ pub fn format_backend_error(error_msg: &str, raw_json: &str) -> String {
 
     // Add specific suggestions based on error type
     if error_msg.contains("token") && error_msg.contains("exceed") {
-        if let Some(requested) = error_msg.split("total of ").nth(1).and_then(|s| s.split(" tokens").next()) {
+        if let Some(requested) = error_msg
+            .split("total of ")
+            .nth(1)
+            .and_then(|s| s.split(" tokens").next())
+        {
             formatted.push_str(&format!("Requested: {} tokens\n", requested));
         }
-        if let Some(limit) = error_msg.split("maximum context length of ").nth(1).and_then(|s| s.split(" tokens").next()) {
+        if let Some(limit) = error_msg
+            .split("maximum context length of ")
+            .nth(1)
+            .and_then(|s| s.split(" tokens").next())
+        {
             formatted.push_str(&format!("Limit: {} tokens\n\n", limit));
         }
         formatted.push_str("💡 Suggestions:\n");
@@ -45,7 +51,10 @@ pub fn format_backend_error(error_msg: &str, raw_json: &str) -> String {
 }
 
 /// Build markdown content for synthetic 404 response listing available models
-pub fn build_model_list_content(requested_model: &str, models: &[crate::models::ModelInfo]) -> String {
+pub fn build_model_list_content(
+    requested_model: &str,
+    models: &[crate::models::ModelInfo],
+) -> String {
     let mut content = format!(
         "❌ Model `{}` not found.\n\n## 📋 Available Models ({} total)\n\n",
         requested_model,
@@ -68,40 +77,46 @@ pub fn build_model_list_content(requested_model: &str, models: &[crate::models::
         }
     }
 
-    let sort_models = |a: &&crate::models::ModelInfo, b: &&crate::models::ModelInfo| -> std::cmp::Ordering {
-        let a_parts: Vec<&str> = a.id.split('/').collect();
-        let b_parts: Vec<&str> = b.id.split('/').collect();
+    let sort_models =
+        |a: &&crate::models::ModelInfo, b: &&crate::models::ModelInfo| -> std::cmp::Ordering {
+            let a_parts: Vec<&str> = a.id.split('/').collect();
+            let b_parts: Vec<&str> = b.id.split('/').collect();
 
-        let first_cmp = a_parts
-            .get(0)
-            .unwrap_or(&"")
-            .to_lowercase()
-            .cmp(&b_parts.get(0).unwrap_or(&"").to_lowercase());
+            let first_cmp = a_parts
+                .first()
+                .unwrap_or(&"")
+                .to_lowercase()
+                .cmp(&b_parts.first().unwrap_or(&"").to_lowercase());
 
-        if first_cmp != std::cmp::Ordering::Equal {
-            return first_cmp;
-        }
+            if first_cmp != std::cmp::Ordering::Equal {
+                return first_cmp;
+            }
 
-        b_parts
-            .get(1)
-            .unwrap_or(&"")
-            .to_lowercase()
-            .cmp(&a_parts.get(1).unwrap_or(&"").to_lowercase())
-    };
+            b_parts
+                .get(1)
+                .unwrap_or(&"")
+                .to_lowercase()
+                .cmp(&a_parts.get(1).unwrap_or(&"").to_lowercase())
+        };
 
     reasoning_models.sort_by(sort_models);
     standard_models.sort_by(sort_models);
 
     let format_two_columns = |models: &[&crate::models::ModelInfo]| -> String {
         let mut result = String::new();
-        let half = (models.len() + 1) / 2;
+        let half = models.len().div_ceil(2);
         for i in 0..half {
             if let Some(&left_model) = models.get(i) {
-                let left_price = crate::constants::get_price_tier(left_model.input_price_usd, left_model.output_price_usd);
+                let left_price = crate::constants::get_price_tier(
+                    left_model.input_price_usd,
+                    left_model.output_price_usd,
+                );
                 let left_formatted = format!("{:4} {}", left_price, left_model.id);
                 if let Some(&right_model) = models.get(i + half) {
-                    let right_price =
-                        crate::constants::get_price_tier(right_model.input_price_usd, right_model.output_price_usd);
+                    let right_price = crate::constants::get_price_tier(
+                        right_model.input_price_usd,
+                        right_model.output_price_usd,
+                    );
                     let right_formatted = format!("{:4} {}", right_price, right_model.id);
                     result.push_str(&format!("  {:48} {}\n", left_formatted, right_formatted));
                 } else {

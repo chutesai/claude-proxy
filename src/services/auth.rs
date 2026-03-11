@@ -1,13 +1,28 @@
-use axum::http::{HeaderMap, HeaderName, header::AUTHORIZATION};
+use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderName};
 
-/// Normalize an Authorization header value into a bare API key
+/// Normalize an Authorization header value into a bare API key.
+/// Handles case-insensitive "Bearer" prefix per RFC 6750 §2.1.
 pub fn normalize_auth_value_to_key(value: &str) -> String {
-    value
-        .trim()
-        .strip_prefix("Bearer ")
-        .map(str::trim)
-        .unwrap_or(value.trim())
-        .to_string()
+    let trimmed = value.trim();
+    // Case-insensitive: check if starts with "bearer" followed by space or end-of-string
+    if trimmed
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer"))
+    {
+        // "Bearer" exactly (no space/token after) → malformed, return empty
+        if trimmed.len() == 6 {
+            return String::new();
+        }
+        // "Bearer " or "Bearer <token>" — extract the token part after "Bearer "
+        if trimmed.as_bytes()[6] == b' ' {
+            let key = trimmed[7..].trim();
+            if key.is_empty() {
+                return String::new();
+            }
+            return key.to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Mask sensitive tokens for logs while keeping useful context
@@ -36,9 +51,10 @@ pub fn extract_client_key(headers: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty());
 
     raw_authorization
-        .as_ref()
-        .map(|auth| normalize_auth_value_to_key(auth))
-        .or_else(|| raw_x_api_key.clone())
+        .as_deref()
+        .map(normalize_auth_value_to_key)
+        .filter(|s| !s.is_empty())
+        .or(raw_x_api_key)
 }
 
 #[cfg(test)]
@@ -82,23 +98,23 @@ mod tests {
 
     #[test]
     fn test_normalize_auth_only_bearer_with_space() {
-        // Input: "Bearer " -> trim -> "Bearer" -> strip_prefix fails -> returns "Bearer"
+        // "Bearer " with nothing after → empty key
         let result = normalize_auth_value_to_key("Bearer ");
-        assert_eq!(result, "Bearer");
+        assert_eq!(result, "");
     }
 
     #[test]
     fn test_normalize_auth_bearer_only_word() {
-        // If input is just "Bearer" with no space, nothing to strip
+        // "Bearer" without trailing space — malformed auth, return empty
         let result = normalize_auth_value_to_key("Bearer");
-        assert_eq!(result, "Bearer");
+        assert_eq!(result, "");
     }
 
     #[test]
     fn test_normalize_auth_lowercase_bearer() {
-        // Note: strip_prefix is case-sensitive, so this won't strip
+        // Case-insensitive Bearer prefix per RFC 6750
         let result = normalize_auth_value_to_key("bearer sk-1234567890");
-        assert_eq!(result, "bearer sk-1234567890");
+        assert_eq!(result, "sk-1234567890");
     }
 
     // ============================================================================
@@ -158,8 +174,11 @@ mod tests {
     #[test]
     fn test_extract_client_key_from_authorization() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer sk-test-123"));
-        
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-test-123"),
+        );
+
         let result = extract_client_key(&headers);
         assert_eq!(result, Some("sk-test-123".to_string()));
     }
@@ -168,7 +187,7 @@ mod tests {
     fn test_extract_client_key_from_x_api_key() {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("sk-test-456"));
-        
+
         let result = extract_client_key(&headers);
         assert_eq!(result, Some("sk-test-456".to_string()));
     }
@@ -176,9 +195,12 @@ mod tests {
     #[test]
     fn test_extract_client_key_authorization_takes_precedence() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer sk-auth-key"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-auth-key"),
+        );
         headers.insert("x-api-key", HeaderValue::from_static("sk-x-key"));
-        
+
         let result = extract_client_key(&headers);
         assert_eq!(result, Some("sk-auth-key".to_string()));
     }
@@ -186,7 +208,7 @@ mod tests {
     #[test]
     fn test_extract_client_key_no_headers() {
         let headers = HeaderMap::new();
-        
+
         let result = extract_client_key(&headers);
         assert_eq!(result, None);
     }
@@ -196,7 +218,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static(""));
         headers.insert("x-api-key", HeaderValue::from_static("sk-fallback"));
-        
+
         let result = extract_client_key(&headers);
         assert_eq!(result, Some("sk-fallback".to_string()));
     }
@@ -206,7 +228,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("   "));
         headers.insert("x-api-key", HeaderValue::from_static("sk-fallback"));
-        
+
         let result = extract_client_key(&headers);
         assert_eq!(result, Some("sk-fallback".to_string()));
     }
@@ -216,7 +238,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static(""));
         headers.insert("x-api-key", HeaderValue::from_static(""));
-        
+
         let result = extract_client_key(&headers);
         assert_eq!(result, None);
     }
@@ -224,9 +246,31 @@ mod tests {
     #[test]
     fn test_extract_client_key_strips_bearer() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer  sk-with-spaces  "));
-        
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer  sk-with-spaces  "),
+        );
+
         let result = extract_client_key(&headers);
         assert_eq!(result, Some("sk-with-spaces".to_string()));
+    }
+
+    #[test]
+    fn test_extract_client_key_malformed_bearer_falls_back_to_x_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer"));
+        headers.insert("x-api-key", HeaderValue::from_static("sk-fallback"));
+
+        let result = extract_client_key(&headers);
+        assert_eq!(result, Some("sk-fallback".to_string()));
+    }
+
+    #[test]
+    fn test_extract_client_key_malformed_bearer_without_fallback_returns_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer "));
+
+        let result = extract_client_key(&headers);
+        assert_eq!(result, None);
     }
 }

@@ -76,7 +76,8 @@ pub struct OAIToolCallDelta {
 #[derive(Deserialize, Default, Debug)]
 pub struct OAIChoiceDelta {
     #[serde(default)]
-    pub _role: Option<String>,
+    #[allow(dead_code)]
+    pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
@@ -89,7 +90,8 @@ pub struct OAIChoiceDelta {
 #[derive(Deserialize, Default, Debug)]
 pub struct OAIChoice {
     #[serde(default)]
-    pub _index: usize,
+    #[allow(dead_code)]
+    pub index: usize,
     // Streaming responses use 'delta', non-streaming use 'message'
     #[serde(default)]
     pub delta: Option<OAIChoiceDelta>,
@@ -101,18 +103,23 @@ pub struct OAIChoice {
 }
 
 #[derive(Deserialize, Default, Debug)]
-// Unknown fields are ignored by default (no deny_unknown_fields attribute)
 pub struct OAIStreamChunk {
-    pub _id: Option<String>,
-    pub _object: Option<String>,
-    pub _created: Option<i64>,
-    pub _model: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub id: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub object: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub created: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub model: Option<String>,
     #[serde(default)]
     pub choices: Vec<OAIChoice>,
-    // Allow error fields for graceful handling
     #[serde(default)]
     pub error: Option<serde_json::Value>,
-    // Usage statistics from backend (optional)
     #[serde(default)]
     pub usage: Option<OAIUsage>,
 }
@@ -124,5 +131,6 @@ pub struct OAIUsage {
     #[serde(default)]
     pub completion_tokens: Option<u32>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub total_tokens: Option<u32>,
 }
