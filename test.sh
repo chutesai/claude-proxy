@@ -19,7 +19,10 @@ CI_MODE=false
 
 # Load environment variables
 if [ -f .env ]; then
-  export $(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs)
+  env_vars=$(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs 2>/dev/null || true)
+  if [ -n "$env_vars" ]; then
+    export $env_vars
+  fi
 fi
 MODEL="${MODEL:-zai-org/GLM-4.5-Air}"
 
@@ -182,9 +185,9 @@ test_parallel() {
       wait $pid
       local result=$?
       if [ $result -eq 0 ]; then
-        ((pass++))
+        pass=$((pass + 1))
       else
-        ((fail++))
+        fail=$((fail + 1))
       fi
     done
     
@@ -300,4 +303,3 @@ done
 
 # If no arguments, show interactive menu
 show_menu
-
