@@ -1,85 +1,50 @@
-# Claude Code Setup Guide
+# Claude Code Setup
 
-This guide explains how to use the proxy with the Claude Code CLI.
+There are two supported ways to use Claude Code with this proxy.
 
-## Quick Setup
+## 1. Hosted Bootstrap
 
-### 1. Start the Proxy
+If you want the Chutes-hosted setup, run:
 
-You can run the proxy using Docker (recommended) or from source.
-
-**Docker:**
 ```bash
-# This starts the proxy on http://localhost:8180
-docker-compose up -d
+./install_claude_code.sh
 ```
 
-**From Source:**
+The script installs or updates Claude Code, fetches the available model list from Chutes, and writes `~/.claude/settings.json` so Claude Code points at `https://claude.chutes.ai`.
+
+## 2. Manual Self-Hosted Setup
+
+Start the proxy first:
+
 ```bash
-# This starts the proxy on http://localhost:8080
+BACKEND_URL=http://127.0.0.1:8000/v1/chat/completions \
+HOST_PORT=8080 \
 cargo run --release
 ```
 
-### 2. Configure Claude Code
+Then configure Claude Code with the same shape the bootstrap script uses:
 
-In your terminal, set two environment variables:
+```json
+{
+  "model": "zai-org/GLM-4.5-Air",
+  "alwaysThinkingEnabled": true,
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080",
+    "ANTHROPIC_AUTH_TOKEN": "cpk_your_backend_key",
+    "API_TIMEOUT_MS": "6000000"
+  }
+}
+```
 
-1.  `ANTHROPIC_BASE_URL`: Point Claude Code to your running proxy.
-2.  `ANTHROPIC_API_KEY`: Provide an API key that is valid for your backend. The proxy will forward this key.
+Write that to `~/.claude/settings.json` and then run:
 
 ```bash
-# If using Docker
-export ANTHROPIC_BASE_URL=http://localhost:8180
-
-# If running from source
-export ANTHROPIC_BASE_URL=http://localhost:8080
-
-# Set your backend-compatible API key
-export ANTHROPIC_API_KEY=cpk_your_backend_api_key
-
-# Run Claude Code
 claude
 ```
 
-That's it! Claude Code will now send requests to the proxy, which forwards them to your configured backend.
+## Notes
 
-## How It Works
-
-The proxy's role is simple: it translates API formats and forwards requests.
-
-```
-Claude Code                Proxy                    Your Backend
-─────────────────────────────────────────────────────────────────
-Sends Claude           →   Accepts Claude         →   Receives OpenAI
-Messages API request       format                     Chat Completions request
-with `ANTHROPIC_API_KEY`   (e.g. cpk_...)             with the same API key.
-                                                      (Authorization header
-                                                       is passed through)
-
-Receives Claude        ←   Converts OpenAI        ←   Sends OpenAI
-response format            response to Claude         response
-                           format
-```
-
-### Authentication Flow
-
-- The proxy extracts the API key sent by the client (e.g., Claude Code).
-- It places this key in the `Authorization` header of the request sent to the backend.
-- **Important**: The proxy does **not** replace keys. If you send an Anthropic-specific key (like `sk-ant-...`), it will be forwarded to your backend, which will likely reject it. You must provide a key that your backend recognizes.
-
-## Troubleshooting
-
-**Q: I'm getting a `401 Unauthorized` error.**
-
-A: This means your backend rejected the API key. Make sure `ANTHROPIC_API_KEY` is set to a valid key for the service configured in `BACKEND_URL`.
-
-**Q: How do I check which key is being used?**
-
-A: Run the proxy with debug logging to see headers.
-
-```bash
-RUST_LOG=debug cargo run --release
-```
-
-Look for logs showing the client authorization header. The proxy will mask the full key for security.
-
+- the proxy forwards the incoming bearer token to the backend
+- use a token your backend accepts
+- Anthropic OAuth tokens like `sk-ant-*` are rejected
+- if your backend exposes `/v1/models`, model selection and case correction work better

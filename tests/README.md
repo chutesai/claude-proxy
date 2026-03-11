@@ -1,118 +1,78 @@
-# Test Suite
+# Tests
 
-Comprehensive test coverage for the Claude-to-OpenAI proxy.
+This repo has two layers of verification:
+- Rust checks: `fmt`, `clippy`, unit tests
+- proxy integration tests: real Claude-shaped requests against a running proxy
 
 ## Quick Start
 
+Against a running proxy:
+
 ```bash
-# Interactive (prompts for API key)
-./test.sh
-
-# Run all tests
-export CHUTES_TEST_API_KEY=cpk_your_key
-./test.sh --all
-
-# CI mode
-CHUTES_TEST_API_KEY=cpk_key ./test.sh --ci --all
+CHUTES_TEST_API_KEY=cpk_your_key ./test.sh --all
 ```
 
-## Test Scripts
+Defaults:
+- `PROXY_URL=http://127.0.0.1:8080`
+- `MODEL=zai-org/GLM-4.5-Air`
 
-**Core functionality:**
-- `test_request.sh` - Basic single request
-- `test_conversation.sh` - Multi-turn conversations (4 scenarios)
-- `test_parallel.sh` - Concurrent requests with timeline
-- `test_claude_code_patterns.sh` - All 9 Claude Code patterns
+## CI-Style Local Run
 
-**Feature-specific:**
-- `test_multimodal.sh` - Image/vision support
-- `test_tool_results.sh` - Tool use and results
-- `test_token_count.sh` - Token counting endpoint
-- `test_model_404.sh` - 404 response handling
-- `test_model_case_correction.sh` - Case-insensitive matching
-- `test_non_streaming.sh` - `stream: false` JSON response and error handling
+Build the release binary first:
 
-**Validation:**
-- `validate_claude_api.sh` - API spec compliance
-- `../validate_tests.sh` - Test script compliance
-
-**CI support:**
-- `mock_openai_backend.py` - Local OpenAI-compatible backend used by GitHub Actions
-
-## Structure
-
-```
-tests/
-├── payloads/                # 12 JSON templates
-│   ├── basic_request.json
-│   ├── conversation_*.json (4 files)
-│   ├── multimodal_image.json
-│   ├── tool_*.json (3 files)
-│   └── parallel_request.json
-│
-├── mock_openai_backend.py   # Deterministic CI backend
-└── test_*.sh                # 11 test scripts
-```
-
-## Coverage
-
-**Fully tested:**
-- All content block types (text, images, tool_use, tool_result)
-- Multi-turn conversations with system prompts
-- All API parameters (temperature, top_p, max_tokens, stop_sequences)
-- Both endpoints (/v1/messages, /v1/messages/count_tokens)
-- All 6 SSE event types
-- Model discovery (404 handling, case-insensitive matching)
-- Concurrent requests
-- Non-streaming JSON responses and Anthropic-style JSON errors
-
-**Partially tested:**
-- Authentication flows (logged but not fully validated)
-- Error handling (404 covered, other codes need work)
-
-**Not tested:**
-- Background model cache refresh (60s interval)
-- Performance under load
-- Edge cases (very long conversations, large payloads)
-
-## Payload Templates
-
-All JSON payloads support template variables:
-- `{{MODEL}}` - Replaced with MODEL from .env
-- `{{NUM}}` - Sequential number for parallel tests
-
-## Usage
-
-**Individual tests:**
 ```bash
-./tests/test_request.sh                    # Basic request
-./tests/test_conversation.sh               # Multi-turn
-./tests/test_parallel.sh [url] [count]     # Concurrent
-./tests/test_multimodal.sh                 # Images
-./tests/test_token_count.sh                # Token counting
-./tests/test_model_404.sh                  # 404 handling
-./tests/test_model_case_correction.sh      # Case matching
-./tests/test_claude_code_patterns.sh       # All 9 patterns
+cargo build --release
 ```
 
-**Unified test runner:**
+Start the mock backend:
+
 ```bash
-./test.sh              # Interactive menu
-./test.sh --all        # Run all tests
-./test.sh --ci --all   # CI mode
+python3 tests/mock_openai_backend.py --port 8000
 ```
 
-**Validation:**
+Start the proxy in another shell:
+
 ```bash
-./validate_tests.sh                        # Check test compliance
-./tests/validate_claude_api.sh             # Validate API responses
+BACKEND_URL=http://127.0.0.1:8000/v1/chat/completions \
+HOST_PORT=8080 \
+target/release/claude_openai_proxy
 ```
 
-## Compliance
+Run the main suite:
 
-All tests conform to Claude Messages API specification:
-- Uses `/v1/messages` endpoint
-- Proper request structure (model, messages, max_tokens, stream)
-- System prompts as top-level field
-- Tools with `input_schema` (not `parameters`)
-- Validates Claude SSE events in responses
+```bash
+CHUTES_TEST_API_KEY=test \
+PROXY_URL=http://127.0.0.1:8080 \
+./test.sh --ci --all
+```
+
+Run the feature scripts:
+
+```bash
+CHUTES_TEST_API_KEY=test PROXY_URL=http://127.0.0.1:8080 ./tests/test_non_streaming.sh
+MODEL=deepseek-r1 CHUTES_TEST_API_KEY=test PROXY_URL=http://127.0.0.1:8080 ./tests/test_thinking.sh
+CHUTES_TEST_API_KEY=test PROXY_URL=http://127.0.0.1:8080 ./tests/validate_claude_api.sh
+```
+
+## What Is Covered
+
+- basic requests, conversations, and parallel requests
+- Claude Code request shapes
+- streaming SSE responses
+- `stream: false` JSON responses
+- tool use and tool results
+- multimodal image inputs
+- token counting
+- model 404 handling and case correction
+- thinking output for reasoning-capable models
+
+## Important Files
+
+- `test.sh`
+  unified entry point for the core suite
+- `tests/mock_openai_backend.py`
+  deterministic OpenAI-compatible backend used in CI and local repros
+- `tests/test_non_streaming.sh`
+  verifies non-streaming success and Anthropic-style JSON errors
+- `tests/validate_claude_api.sh`
+  checks response shape for Claude-facing compatibility

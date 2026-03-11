@@ -1,227 +1,129 @@
-# Claude Proxy for Chutes.ai
+# Claude Proxy
 
-Lightweight proxy that translates Claude Messages API to OpenAI Chat Completions format with SSE streaming.
+Claude Messages API proxy for OpenAI-compatible backends.
 
-Routes Claude Code / Claude API requests to any OpenAI-compatible backend (SGLang, vLLM, Ollama, etc.)
+It lets Claude Code or other Claude clients talk to a backend that exposes `/v1/chat/completions`, while preserving Claude-style streaming, tool calls, token counting, and model-friendly errors.
 
-## Features
+## Fastest Bootstrap
 
-- Full Claude API compatibility (text, images, tool_use, tool_result)
-- SSE streaming with proper event formatting
-- **Thinking/reasoning content support** - Auto-enables for reasoning models, streams thinking blocks
-- Client key forwarding (forwards client API keys directly to backend)
-- Model discovery with 60s cache refresh
-- Case-insensitive model matching with helpful 404 responses
-- Token counting endpoint (tiktoken-based)
-- Optional circuit breaker (disabled by default, can be enabled via env)
-- Health check endpoint
-- Request validation (max 10,000 messages, 10MB content)
+If you want the hosted Chutes setup, use the installer:
 
-## Quick Start
-
-**Docker (default port 8180):**
 ```bash
-docker-compose up -d
-export ANTHROPIC_BASE_URL=http://localhost:8180
-export ANTHROPIC_API_KEY=cpk_your_api_key
-claude
+./install_claude_code.sh
 ```
 
-**From Source (default port 8080):**
+That script:
+- installs or updates Node.js and `@anthropic-ai/claude-code`
+- fetches models from `https://llm.chutes.ai/v1/models`
+- writes `~/.claude/settings.json`
+- points Claude Code at `https://claude.chutes.ai`
+
+This is the easiest way to get Claude Code working against the hosted proxy.
+
+## Self-Host
+
+### Run From Source
+
 ```bash
-cargo build --release
+BACKEND_URL=http://127.0.0.1:8000/v1/chat/completions \
+HOST_PORT=8080 \
 cargo run --release
-export ANTHROPIC_BASE_URL=http://localhost:8080
-export ANTHROPIC_API_KEY=cpk_your_api_key
-claude
 ```
+
+The binary listens on `HOST_PORT`, which defaults to `8080`.
+
+### Run With Docker Compose
+
+For a simple local setup without TLS:
+
+```bash
+HOST_PORT=8181 \
+CADDY_PORT=8180 \
+CADDY_TLS=false \
+BACKEND_URL=https://llm.chutes.ai/v1/chat/completions \
+docker compose up -d --build
+```
+
+With Compose:
+- the proxy listens directly on `HOST_PORT`
+- Caddy fronts it on `CADDY_PORT`
+- `.env.example` is a starting point, not a one-size-fits-all local config
+
+## Configure Claude Code Manually
+
+If you are not using the installer, configure Claude Code the same way the bootstrap script does:
+
+```json
+{
+  "model": "zai-org/GLM-4.5-Air",
+  "alwaysThinkingEnabled": true,
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080",
+    "ANTHROPIC_AUTH_TOKEN": "cpk_your_backend_key",
+    "API_TIMEOUT_MS": "6000000"
+  }
+}
+```
+
+Put that in `~/.claude/settings.json` and adjust the URL, token, and model for your setup.
+
+Important:
+- the proxy forwards the client bearer token to the backend
+- use a backend-compatible token such as `cpk_*`
+- Anthropic OAuth tokens like `sk-ant-*` are rejected
+
+## Endpoints
+
+- `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
+- `GET /health`
+
+## What Works
+
+- Claude-style SSE streaming and `stream: false`
+- text, image, system, tool use, and tool result blocks
+- multi-turn conversations
+- model discovery and case correction when `/v1/models` is available
+- thinking blocks when the backend exposes reasoning output
+
+## Important Limits
+
+- only inline base64 document inputs are translated; URL/file-backed documents are degraded instead of forwarded
+- prompt caching, citations, server tools, and audio are not implemented
+- best results come from backends that expose both `/v1/chat/completions` and `/v1/models`
 
 ## Configuration
 
-Environment variables:
-- `BACKEND_URL` - Backend chat completions endpoint.
-  - Default (source): `http://127.0.0.1:8000/v1/chat/completions`
-  - Default (Docker): `https://llm.chutes.ai/v1/chat/completions`
-- `HOST_PORT` - Port to listen on (default: `8080`)
-- `RUST_LOG` - Log level: `error`, `warn`, `info`, `debug`, `trace` (default: `info`)
-- `BACKEND_TIMEOUT_SECS` - Backend request timeout in seconds (default: `600`)
-- `ENABLE_CIRCUIT_BREAKER` - Enable circuit breaker protection (default: `false`)
-  - Opens after 5 consecutive failures, recovers after 30s
-
-**Example `.env` (for running from source):**
-```bash
-BACKEND_URL=http://127.0.0.1:8000/v1/chat/completions
-HOST_PORT=8080
-RUST_LOG=info
-ENABLE_CIRCUIT_BREAKER=false
-```
-
-**Authentication:**
-- Client API key (`cpk_*` or backend-compatible) → forwarded directly to backend
-- Anthropic OAuth tokens (`sk-ant-*`) → rejected with 401 (not supported)
-- No client auth → rejected with 401
-
-## API Endpoints
-
-- `POST /v1/messages` - Main Claude Messages API endpoint
-- `POST /v1/messages/count_tokens` - Token counting (tiktoken-based)
-- `GET /health` - Health check with circuit breaker status (if enabled)
-
-**Example request:**
-```bash
-curl -N http://localhost:8080/v1/messages \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer cpk_your_key' \
-  -d '{
-    "model": "zai-org/GLM-4.5-Air",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "max_tokens": 128,
-    "stream": true
-  }'
-```
-
-## Supported Features
-
-- **Text content** - String or content blocks
-- **Images** - Base64 encoded, converted to OpenAI data URI format
-- **Tool use/results** - Full function calling support with `tool_choice` parameter
-- **System prompts** - Converted to system message
-- **Multi-turn conversations** - Context preservation (up to 10K messages)
-- **Thinking/reasoning content** - Automatic detection and streaming for reasoning models
-- **Advanced sampling** - Supports `temperature`, `top_p`, `top_k`
-- **Model discovery** - Auto-refresh every 60s, case-insensitive matching
-
-### Thinking/Reasoning Content
-
-The proxy automatically handles thinking content for reasoning models:
-
-**Auto-enablement:**
-- Models containing "reasoning", "r1", or "deep" in the name automatically enable thinking with a 10,000 token budget
-- Override by explicitly providing `thinking` parameter in request
-
-**Input transformation:**
-- Assistant messages with thinking blocks → interleaved format: `<think>reasoning</think>\nresponse`
-- Preserves historical thinking content for multi-turn conversations
-
-**Output streaming:**
-- Backend `reasoning_content` → proper Claude thinking blocks
-- Thinking blocks streamed before text blocks
-- Event sequence: `content_block_start` (thinking) → `content_block_delta` (thinking_delta) → `content_block_stop` → text blocks
-
-**Example request:**
-```bash
-curl -N http://localhost:8080/v1/messages \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer cpk_your_key' \
-  -d '{
-    "model": "deepseek-r1",
-    "messages": [{"role": "user", "content": "What is 2+2?"}],
-    "max_tokens": 1024,
-    "stream": true
-  }'
-```
-
-**Test:**
-```bash
-cd tests
-./test_thinking.sh
-```
-
-## Usage with Claude Code
-
-**Model selection:**
-```bash
-/model zai-org/GLM-4.5-Air              # Free
-/model deepseek/DeepSeek-R1             # Reasoning  
-/model anthropic/claude-3-5-sonnet      # Standard
-```
-
-**Other SDKs:**
-```python
-from anthropic import Anthropic
-client = Anthropic(
-    base_url="http://localhost:8080",
-    api_key="cpk_your_key"
-)
-```
-
-```javascript
-const client = new Anthropic({
-  baseURL: 'http://localhost:8080',
-  apiKey: 'cpk_your_key'
-});
-```
-
-## Deployment
-
-**Docker Compose:**
-```bash
-docker-compose up -d
-```
-
-Includes Caddy reverse proxy for SSL/TLS. See [docs/DOCKER.md](docs/DOCKER.md) for production setup.
-
-**Remote Client Connection:**
-```bash
-export ANTHROPIC_BASE_URL=https://your-domain.com
-export ANTHROPIC_API_KEY=cpk_your_api_key
-claude
-```
+- `BACKEND_URL`
+  OpenAI-compatible chat completions endpoint
+  Default: `http://127.0.0.1:8000/v1/chat/completions`
+- `HOST_PORT`
+  Listen port for the Rust proxy
+  Default: `8080`
+- `BACKEND_TIMEOUT_SECS`
+  Backend request timeout
+  Default: `600`
+- `ENABLE_CIRCUIT_BREAKER`
+  Optional backend failure protection
+  Default: `false`
+- `RUST_LOG`
+  Log level
+  Default: `info`
 
 ## Testing
 
 ```bash
-./test.sh --all    # Run full test suite
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+./test.sh --ci --all
 ```
 
-Set `CHUTES_TEST_API_KEY=cpk_your_key` in `.env` or export before running tests.
+More test details live in [tests/README.md](tests/README.md).
 
-### Unit Tests (81 tests ✅)
+## Docs
 
-```bash
-cargo test              # Run all unit tests
-cargo test auth         # Run auth module tests
-cargo test streaming    # Run SSE parser tests
-cargo test content_extraction  # Run content translation tests
-```
-
-**Coverage:** 90%+ for critical utilities (auth, streaming, content extraction)
-
-## Building
-
-```bash
-cargo build --release    # Binary: target/release/claude_openai_proxy (~4MB)
-cargo test              # Run unit tests (81 tests)
-cargo test -- --nocapture  # Show test output
-```
-
-## Documentation
-
-- [API Reference](docs/API_REFERENCE.md) - Complete API specification
-- [API Comparison](docs/API_COMPARISON.md) - Detailed Anthropic vs OpenAI spec comparison
-- [Spec Analysis Summary](docs/SPEC_ANALYSIS_SUMMARY.md) - Executive summary of API compatibility
-- [Spec Sources](docs/SPEC_SOURCES.md) - Information about cloned API specifications
-- [Test Coverage Summary](docs/TEST_COVERAGE_SUMMARY.md) - Unit test coverage report
-- [Docker Guide](docs/DOCKER.md) - Deployment with SSL/TLS
-- [Production Guide](docs/PRODUCTION_GUIDE.md) - Production features and monitoring
-- [Implementation Details](docs/IMPLEMENTATION_DETAILS.md) - Architecture and design
-
-### API Specification Analysis
-
-We've analyzed the official Anthropic Messages API and OpenAI Chat Completions API specs:
-
-- ✅ **~95% core compatibility** for standard use cases (text, images, tools, streaming)
-- ✅ **Tool choice** - Force specific tools or disable tool usage (v0.1.5)
-- ✅ **Advanced sampling** - `top_k` parameter support (v0.1.5)
-- ✅ **Long conversations** - 10K message limit (v0.1.5)
-- ⚠️  **Partial support** for advanced features (response_format, PDFs)
-- ❌ **Unsupported** features: server tools, prompt caching, citations, audio
-
-See [API_COMPARISON.md](docs/API_COMPARISON.md) and [CHANGELOG.md](CHANGELOG.md) for details.
-
-## Troubleshooting
-
-- **401 Unauthorized** - Ensure client sends a valid backend-compatible API key. The proxy forwards the client's `Authorization: Bearer <key>` directly to the backend. Anthropic OAuth tokens (`sk-ant-*`) are not supported.
-- **404 Model Not Found** - Use `/model` in Claude Code to see available models
-- **Circuit breaker open** - Backend failing; check health endpoint: `curl http://localhost:8080/health` (or port 8180 for Docker)
-- **Debug logging** - `RUST_LOG=debug cargo run --release`
+- [docs/README.md](docs/README.md)
+- [docs/CLAUDE_CODE_SETUP.md](docs/CLAUDE_CODE_SETUP.md)
+- [docs/DOCKER.md](docs/DOCKER.md)
+- [docs/API_REFERENCE.md](docs/API_REFERENCE.md)
