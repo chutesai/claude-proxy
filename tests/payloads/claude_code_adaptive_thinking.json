@@ -1,0 +1,17 @@
+{
+  "model": "{{MODEL}}",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Say hello briefly."
+    }
+  ],
+  "thinking": {
+    "type": "adaptive"
+  },
+  "output_config": {
+    "effort": "low"
+  },
+  "max_tokens": 128,
+  "stream": true
+}

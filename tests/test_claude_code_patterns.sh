@@ -1,24 +1,19 @@
 #!/bin/bash
-# Test all known Claude Code request patterns
-# Validates the proxy handles every content type Claude Code might send
-
-# set -e # Don't exit on error, we want to run all tests
+# Smoke-test Claude Code request patterns against the proxy.
+# This validates proxy acceptance/translation coverage, not backend feature parity.
 
 PROXY_URL="${PROXY_URL:-${1:-http://127.0.0.1:8080}}"
 
-# Load env
 if [ -f .env ]; then
   env_vars=$(grep -v '^#' .env | grep -E '(API_KEY|MODEL|CHUTES_TEST_API_KEY)' | xargs 2>/dev/null || true)
   if [ -n "$env_vars" ]; then
     export $env_vars
   fi
 fi
-MODEL="${MODEL:-zai-org/GLM-4.5-Air}"
 
-# Use CHUTES_TEST_API_KEY if available, fallback to API_KEY
+MODEL="${MODEL:-zai-org/GLM-4.5-Air}"
 API_KEY="${CHUTES_TEST_API_KEY:-${API_KEY:-}}"
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -27,151 +22,150 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 echo -e "${BLUE}═══════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}  Claude Code Request Pattern Tests${NC}"
-echo -e "${BLUE}  Validates All Known Message Formats${NC}"
+echo -e "${BLUE}  Claude Code Compatibility Smoke Tests${NC}"
+echo -e "${BLUE}  Exercises current request shapes and proxy bridges${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════${NC}"
 echo ""
 
 PASSED=0
 FAILED=0
 
-# Helper to test a payload
-test_payload() {
-  local name=$1
-  local payload_file=$2
-  local description=$3
-  
-  echo -e "${CYAN}[$name]${NC} $description"
-  
-  if [ ! -f "$payload_file" ]; then
-    echo -e "  ${RED}✗ Payload file not found${NC}"
-    ((FAILED++))
-    return
-  fi
-  
-  local payload=$(cat "$payload_file" | sed "s|{{MODEL}}|$MODEL|g")
-  
+run_payload() {
+  local payload=$1
   local cmd="curl -s -N $PROXY_URL/v1/messages -H 'content-type: application/json'"
   [ -n "$API_KEY" ] && cmd="$cmd -H 'Authorization: Bearer $API_KEY'"
   cmd="$cmd -d '$payload'"
-  
-  local response=$(eval "$cmd" 2>&1 | head -50)
-  
-  # Check if proxy forwarded to backend
+  eval "$cmd" 2>&1 | head -50
+}
+
+evaluate_response() {
+  local response=$1
+
   if echo "$response" | grep -q "backend_error"; then
-    # Proxy forwarded but backend rejected (might not support this feature)
-    echo -e "  ${YELLOW}⚠ BACKEND LIMITATION${NC} - Proxy forwarded correctly, backend doesn't support"
-    ((PASSED++))  # Proxy did its job
+    echo -e "  ${YELLOW}⚠ BACKEND LIMITATION${NC} - Proxy forwarded correctly, backend feature mismatch"
+    ((PASSED++))
     return
   fi
-  
-  # Check proxy accepted request (got message_start)
+
   if ! echo "$response" | grep -q "message_start"; then
-    echo -e "  ${RED}✗ FAIL${NC} - Proxy rejected request or no response"
-    echo "  Response: ${response:0:100}"
+    echo -e "  ${RED}✗ FAIL${NC} - Proxy rejected request or returned no Claude stream"
+    echo "  Response: ${response:0:160}"
     ((FAILED++))
     return
   fi
-  
-  # Check NO OpenAI format
+
   if echo "$response" | grep -q '"choices"'; then
-    echo -e "  ${RED}✗ CRITICAL${NC} - OpenAI format detected!"
+    echo -e "  ${RED}✗ CRITICAL${NC} - OpenAI wire format leaked to client"
     ((FAILED++))
     return
   fi
-  
-  # Check proper Claude SSE format
+
   if ! echo "$response" | grep -q "event: message_start"; then
-    echo -e "  ${YELLOW}⚠ WARNING${NC} - Missing SSE event format"
+    echo -e "  ${YELLOW}⚠ WARNING${NC} - Missing explicit SSE event labels"
   fi
-  
-  echo -e "  ${GREEN}✓ PASS${NC} - Proxy handled request correctly"
+
+  echo -e "  ${GREEN}✓ PASS${NC} - Proxy accepted and translated request"
   ((PASSED++))
 }
 
-# Test 1: String content (simplest form)
-test_payload "1/9" "tests/payloads/basic_request.json" \
-  "String content (Claude Code simple text)"
+test_payload_file() {
+  local name=$1
+  local payload_file=$2
+  local description=$3
 
-# Test 2: Content blocks array with text
-test_payload "2/9" "tests/payloads/content_blocks_text.json" \
-  "Content blocks array [{type: text}]"
+  echo -e "${CYAN}[$name]${NC} $description"
 
-# Test 3: Mixed content blocks (text + image)
-test_payload "3/9" "tests/payloads/content_blocks_mixed.json" \
-  "Mixed content blocks (text + image)"
+  if [ ! -f "$payload_file" ]; then
+    echo -e "  ${RED}✗ FAIL${NC} - Payload file not found"
+    ((FAILED++))
+    return
+  fi
 
-# Test 4: System prompt
-test_payload "4/9" "tests/payloads/conversation_3_system.json" \
+  local payload
+  payload=$(sed "s|{{MODEL}}|$MODEL|g" "$payload_file")
+  local response
+  response=$(run_payload "$payload")
+  evaluate_response "$response"
+}
+
+test_inline_payload() {
+  local name=$1
+  local description=$2
+  local payload=$3
+
+  echo -e "${CYAN}[$name]${NC} $description"
+  local response
+  response=$(run_payload "$payload")
+  evaluate_response "$response"
+}
+
+test_payload_file "1/14" "tests/payloads/basic_request.json" \
+  "String content (simple Claude Code prompt)"
+
+test_payload_file "2/14" "tests/payloads/content_blocks_text.json" \
+  "Content blocks array with text"
+
+test_payload_file "3/14" "tests/payloads/content_blocks_mixed.json" \
+  "Mixed text + image content blocks"
+
+test_payload_file "4/14" "tests/payloads/conversation_3_system.json" \
   "Top-level system prompt"
 
-# Test 5: Multi-turn conversation
-test_payload "5/9" "tests/payloads/conversation_2_followup.json" \
-  "Multi-turn conversation with context"
+test_payload_file "5/14" "tests/payloads/conversation_2_followup.json" \
+  "Multi-turn conversation history"
 
-# Test 6: Tool definitions
-test_payload "6/9" "tests/payloads/conversation_4_tools.json" \
-  "Tool definitions with input_schema"
+test_payload_file "6/14" "tests/payloads/conversation_4_tools.json" \
+  "Single-tool definitions with input_schema"
 
-# Test 7: Tool result in conversation
-test_payload "7/9" "tests/payloads/tool_result.json" \
-  "Tool result content block (tool_use_id)"
+test_payload_file "7/14" "tests/payloads/tool_result.json" \
+  "Tool result block in user history"
 
-# Test 8: Temperature and top_p
-echo -e "${CYAN}[8/9]${NC} Temperature and top_p parameters"
-PAYLOAD='{"model":"'$MODEL'","messages":[{"role":"user","content":"test"}],"max_tokens":50,"temperature":0.7,"top_p":0.9,"stream":true}'
-RESPONSE=$(curl -s -N $PROXY_URL/v1/messages -H 'content-type: application/json' -H "Authorization: Bearer ${API_KEY:-test}" -d "$PAYLOAD" 2>&1 | head -20)
+test_payload_file "8/14" "tests/payloads/claude_code_adaptive_thinking.json" \
+  "Claude Code adaptive thinking + output_config.effort"
 
-if echo "$RESPONSE" | grep -q "message_start"; then
-  echo -e "  ${GREEN}✓ PASS${NC} - Parameters accepted"
-  ((PASSED++))
-else
-  echo -e "  ${RED}✗ FAIL${NC} - Request rejected"
-  ((FAILED++))
-fi
+test_payload_file "9/14" "tests/payloads/cache_control_request.json" \
+  "Prompt caching markers accepted (and dropped safely)"
 
-# Test 9: Stop sequences
-echo -e "${CYAN}[9/9]${NC} Stop sequences parameter"
-PAYLOAD='{"model":"'$MODEL'","messages":[{"role":"user","content":"count: 1,2,3"}],"max_tokens":50,"stop_sequences":[","],"stream":true}'
-RESPONSE=$(curl -s -N $PROXY_URL/v1/messages -H 'content-type: application/json' -H "Authorization: Bearer ${API_KEY:-test}" -d "$PAYLOAD" 2>&1 | head -20)
+test_payload_file "10/14" "tests/payloads/documents_request.json" \
+  "Document inputs (base64, file_id, and URL fallback)"
 
-if echo "$RESPONSE" | grep -q "message_start"; then
-  echo -e "  ${GREEN}✓ PASS${NC} - Stop sequences accepted"
-  ((PASSED++))
-else
-  echo -e "  ${RED}✗ FAIL${NC} - Request rejected"
-  ((FAILED++))
-fi
+test_payload_file "11/14" "tests/payloads/unknown_content_blocks.json" \
+  "Unsupported/new Claude content blocks degrade safely"
 
-# Summary
+test_payload_file "12/14" "tests/payloads/multi_tool_request.json" \
+  "Multiple tool definitions"
+
+test_inline_payload "13/14" "Temperature and top_p parameters" \
+  "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"test\"}],\"max_tokens\":50,\"temperature\":0.7,\"top_p\":0.9,\"stream\":true}"
+
+test_inline_payload "14/14" "Stop sequences parameter" \
+  "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"count: 1,2,3\"}],\"max_tokens\":50,\"stop_sequences\":[\",\"],\"stream\":true}"
+
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════${NC}"
 echo -e "${BLUE}  Summary${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "Total patterns tested: $((PASSED + FAILED))"
+echo -e "Total patterns exercised: $((PASSED + FAILED))"
 echo -e "${GREEN}Passed: $PASSED${NC}"
 echo -e "${RED}Failed: $FAILED${NC}"
 echo ""
 
 if [ $FAILED -eq 0 ]; then
-  echo -e "${GREEN}✅ All Claude Code patterns supported!${NC}"
+  echo -e "${GREEN}✅ All exercised Claude Code request patterns were accepted by the proxy${NC}"
   echo ""
-  echo "Proxy handles:"
-  echo "  ✓ String content"
-  echo "  ✓ Content blocks array (text, image, tool_result)"
-  echo "  ✓ System prompts"
-  echo "  ✓ Multi-turn conversations"
-  echo "  ✓ Tool definitions with input_schema"
-  echo "  ✓ Tool results in conversation"
-  echo "  ✓ Temperature, top_p parameters"
-  echo "  ✓ Stop sequences"
-  echo "  ✓ Authorization forwarding"
-  echo ""
-  echo "Ready for Claude Code integration! 🚀"
+  echo "Covered request shapes:"
+  echo "  ✓ String and text-block content"
+  echo "  ✓ Image and document inputs"
+  echo "  ✓ System prompts and multi-turn history"
+  echo "  ✓ Tool definitions and tool results"
+  echo "  ✓ Adaptive thinking and effort controls"
+  echo "  ✓ Prompt caching markers"
+  echo "  ✓ Unknown/newer Claude blocks degrading safely"
+  echo "  ✓ Sampling and stop-sequence parameters"
   exit 0
 else
-  echo -e "${RED}✗ Some patterns failed${NC}"
-  echo "Check logs for details"
+  echo -e "${RED}✗ Some request patterns failed${NC}"
+  echo "Check proxy logs for details"
   exit 1
 fi

@@ -1,0 +1,43 @@
+{
+  "model": "{{MODEL}}",
+  "messages": [
+    {
+      "role": "user",
+      "content": "List the project files and then read README.md."
+    }
+  ],
+  "tools": [
+    {
+      "name": "list_files",
+      "description": "List files in a directory",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "read_file",
+      "description": "Read a file from disk",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  ],
+  "max_tokens": 128,
+  "stream": true
+}

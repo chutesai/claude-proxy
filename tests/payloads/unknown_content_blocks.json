@@ -1,0 +1,42 @@
+{
+  "model": "{{MODEL}}",
+  "messages": [
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "server_tool_use",
+          "name": "bash",
+          "input": {
+            "command": "ls"
+          }
+        },
+        {
+          "type": "text",
+          "text": "Ran a command."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "search_result",
+          "query": "weather in New York",
+          "content": [
+            {
+              "type": "text",
+              "text": "Sunny and 68F"
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "text": "Summarize it briefly."
+        }
+      ]
+    }
+  ],
+  "max_tokens": 128,
+  "stream": true
+}

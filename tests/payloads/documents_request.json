@@ -1,0 +1,38 @@
+{
+  "model": "{{MODEL}}",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Review these attachments."
+        },
+        {
+          "type": "document",
+          "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "ZmFrZQ=="
+          }
+        },
+        {
+          "type": "document",
+          "source": {
+            "type": "file",
+            "file_id": "file_123"
+          }
+        },
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "url": "https://example.com/file.pdf"
+          }
+        }
+      ]
+    }
+  ],
+  "max_tokens": 128,
+  "stream": true
+}
