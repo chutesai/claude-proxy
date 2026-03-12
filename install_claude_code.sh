@@ -22,8 +22,7 @@ E2EE_PROXY_HOST="https://e2ee-local-proxy.chutes.dev"
 E2EE_IMAGE="parachutes/e2ee-proxy:latest"
 E2EE_CONTAINER_NAME="chutes-e2ee-local-proxy"
 DEFAULT_E2EE_PORT=8443
-DEFAULT_MODEL_HOSTED="deepseek-ai/DeepSeek-R1"
-DEFAULT_MODEL_E2EE="zai-org/GLM-4.7-TEE"
+DEFAULT_MODEL="zai-org/GLM-4.7-TEE"
 PROXY_BASE_URL="$HOSTED_PROXY_BASE_URL"
 USE_E2EE_PROXY="${USE_E2EE_PROXY:-}"
 E2EE_SELECTED_PORT=""
@@ -405,12 +404,8 @@ configure_claude_json(){
 
 select_model() {
     local preferred_model="${1:-}"
-    local default_model="$DEFAULT_MODEL_HOSTED"
+    local default_model="$DEFAULT_MODEL"
     local models_error=""
-
-    if [ "$USE_E2EE_PROXY" = "1" ]; then
-        default_model="$DEFAULT_MODEL_E2EE"
-    fi
     
     log_info "Fetching available models from $BACKEND_BASE_URL..." >&2
     
