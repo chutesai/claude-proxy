@@ -19,6 +19,7 @@ use services::model_cache::refresh_models_cache;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeConfig {
     backend_url: String,
+    backend_host_header: Option<String>,
     backend_timeout_secs: u64,
     circuit_breaker_enabled: bool,
     host_port: u16,
@@ -33,6 +34,7 @@ impl RuntimeConfig {
         Self {
             backend_url: get("BACKEND_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:8000/v1/chat/completions".into()),
+            backend_host_header: get("BACKEND_HOST_HEADER"),
             backend_timeout_secs: get("BACKEND_TIMEOUT_SECS")
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(600),
@@ -61,6 +63,7 @@ fn build_app(config: &RuntimeConfig) -> App {
             .build()
             .unwrap(),
         backend_url: config.backend_url.clone(),
+        backend_host_header: config.backend_host_header.clone(),
         models_cache,
         circuit_breaker,
     }
@@ -174,6 +177,7 @@ mod tests {
             config,
             RuntimeConfig {
                 backend_url: "http://127.0.0.1:8000/v1/chat/completions".into(),
+                backend_host_header: None,
                 backend_timeout_secs: 600,
                 circuit_breaker_enabled: false,
                 host_port: 8080,
@@ -185,6 +189,7 @@ mod tests {
     fn test_runtime_config_respects_overrides_and_fallbacks() {
         let config = RuntimeConfig::from_env_with(|key| match key {
             "BACKEND_URL" => Some("https://example.com/v1/chat/completions".into()),
+            "BACKEND_HOST_HEADER" => Some("llm.chutes.ai".into()),
             "BACKEND_TIMEOUT_SECS" => Some("45".into()),
             "ENABLE_CIRCUIT_BREAKER" => Some("true".into()),
             "HOST_PORT" => Some("9090".into()),
@@ -195,6 +200,7 @@ mod tests {
             config,
             RuntimeConfig {
                 backend_url: "https://example.com/v1/chat/completions".into(),
+                backend_host_header: Some("llm.chutes.ai".into()),
                 backend_timeout_secs: 45,
                 circuit_breaker_enabled: true,
                 host_port: 9090,
@@ -217,6 +223,7 @@ mod tests {
     async fn test_build_app_uses_runtime_config() {
         let config = RuntimeConfig {
             backend_url: "http://127.0.0.1:9999/v1/chat/completions".into(),
+            backend_host_header: Some("llm.chutes.ai".into()),
             backend_timeout_secs: 123,
             circuit_breaker_enabled: true,
             host_port: 8080,

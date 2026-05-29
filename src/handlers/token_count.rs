@@ -28,6 +28,7 @@ mod tests {
         App {
             client: reqwest::Client::new(),
             backend_url: "http://127.0.0.1:8000/v1/chat/completions".into(),
+            backend_host_header: None,
             models_cache: Arc::new(RwLock::new(None)),
             circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState::new(false))),
         }

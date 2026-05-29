@@ -1458,6 +1458,10 @@ pub async fn messages(
         .post(&app.backend_url)
         .header("content-type", "application/json");
 
+    if let Some(host) = &app.backend_host_header {
+        req = req.header("host", host);
+    }
+
     // Auth: Forward client key to backend, or reject if invalid/missing
     if let Some(key) = &client_key {
         if key.contains("sk-ant-") {
@@ -2088,6 +2092,7 @@ mod tests {
         App {
             client: reqwest::Client::new(),
             backend_url,
+            backend_host_header: None,
             models_cache: Arc::new(RwLock::new(None)),
             circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState {
                 consecutive_failures: if circuit_open { 5 } else { 0 },
