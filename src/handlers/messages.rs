@@ -1458,11 +1458,23 @@ pub async fn messages(
         .post(&app.backend_url)
         .header("content-type", "application/json");
 
+    // Forward client headers, skipping hop-by-hop and headers we set ourselves
+    for (name, value) in headers.iter() {
+        match name.as_str() {
+            "host" | "connection" | "keep-alive" | "transfer-encoding" | "upgrade"
+            | "proxy-authenticate" | "proxy-authorization" | "te" | "trailers"
+            | "content-type" | "content-length" => {}
+            _ => {
+                req = req.header(name, value);
+            }
+        }
+    }
+
     if let Some(host) = &app.backend_host_header {
         req = req.header("host", host);
     }
 
-    // Auth: Forward client key to backend, or reject if invalid/missing
+    // Validate auth: reject Anthropic OAuth tokens, require some key
     if let Some(key) = &client_key {
         if key.contains("sk-ant-") {
             log::warn!("❌ Anthropic OAuth tokens (sk-ant-*) are not supported - use backend-compatible key (cpk_*)");
@@ -1474,7 +1486,6 @@ pub async fn messages(
                 "Anthropic OAuth tokens are not supported; use a backend-compatible API key",
             );
         }
-        req = req.bearer_auth(key);
         log::info!("🔄 Auth: Forwarding client key to backend");
     } else {
         log::warn!("❌ No client API key provided");
