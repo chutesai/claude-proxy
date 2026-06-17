@@ -1,6 +1,6 @@
 use crate::constants::*;
 use crate::models::{
-    App, ClaudeContentBlock, ClaudeRequest, OAIChatReq, OAIMessage, OAIStreamChunk,
+    App, ClaudeContentBlock, ClaudeRequest, OAIChatReq, OAIMessage, OAIStreamChunk, StreamOptions,
 };
 use crate::services::{
     build_model_list_content, extract_client_key, format_backend_error, get_available_models,
@@ -98,11 +98,19 @@ fn build_non_streaming_response(
     stop_reason: &str,
     input_tokens: u32,
     output_tokens: u32,
+    cache_read_tokens: u32,
 ) -> Response {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let mut usage = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens
+    });
+    if cache_read_tokens > 0 {
+        usage["cache_read_input_tokens"] = json!(cache_read_tokens);
+    }
     let body = json!({
         "id": format!("msg_{}", now),
         "type": "message",
@@ -111,10 +119,7 @@ fn build_non_streaming_response(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": Value::Null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": usage
     });
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "application/json".parse().unwrap());
@@ -353,6 +358,8 @@ struct StreamState {
     final_stop_reason: &'static str,
     output_token_count: u32,
     backend_reported_usage: bool,
+    backend_input_tokens: Option<u32>,
+    backend_cache_read_tokens: Option<u32>,
 }
 
 enum StreamPayloadOutcome {
@@ -800,6 +807,23 @@ async fn process_backend_sse_payload(
         return StreamPayloadOutcome::ClientDisconnected;
     }
 
+    // Usage may arrive on a final usage-only chunk (choices: []), so read it
+    // before the empty-choices guard below would otherwise drop it.
+    if let Some(usage) = &chunk.usage {
+        if let Some(prompt_tokens) = usage.prompt_tokens {
+            state.backend_input_tokens = Some(prompt_tokens);
+        }
+        if let Some(completion_tokens) = usage.completion_tokens {
+            state.output_token_count = completion_tokens;
+            state.backend_reported_usage = true;
+        }
+        if let Some(details) = &usage.prompt_tokens_details {
+            if let Some(cached) = details.cached_tokens {
+                state.backend_cache_read_tokens = Some(cached);
+            }
+        }
+    }
+
     if chunk.choices.is_empty() {
         log::debug!("⚠️  Chunk has no choices, skipping");
         return StreamPayloadOutcome::Continue;
@@ -814,20 +838,6 @@ async fn process_backend_sse_payload(
             reason,
             state.final_stop_reason
         );
-    }
-
-    if let Some(usage) = &chunk.usage {
-        if let Some(prompt_tokens) = usage.prompt_tokens {
-            log::debug!("📊 Backend reported prompt tokens: {}", prompt_tokens);
-        }
-        if let Some(completion_tokens) = usage.completion_tokens {
-            state.output_token_count = completion_tokens;
-            state.backend_reported_usage = true;
-            log::debug!(
-                "📊 Backend reported completion tokens: {}",
-                completion_tokens
-            );
-        }
     }
 
     if let Some(message) = &choice.message {
@@ -1451,6 +1461,13 @@ pub async fn messages(
         parallel_tool_calls,
         metadata: cr.metadata,
         stream: client_wants_stream,
+        stream_options: if client_wants_stream {
+            Some(StreamOptions {
+                include_usage: true,
+            })
+        } else {
+            None
+        },
     };
 
     let mut req = app
@@ -1638,6 +1655,7 @@ pub async fn messages(
                         "end_turn",
                         input_token_count,
                         50,
+                        0,
                     ));
                 }
             }
@@ -1788,6 +1806,12 @@ pub async fn messages(
             .and_then(|u| u.get("completion_tokens"))
             .and_then(|t| t.as_u64())
             .unwrap_or(0) as u32;
+        let cache_read_tokens = usage
+            .and_then(|u| u.get("prompt_tokens_details"))
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0) as u32;
+        let input_tokens = prompt_tokens.saturating_sub(cache_read_tokens);
 
         // Record circuit breaker success
         {
@@ -1799,8 +1823,9 @@ pub async fn messages(
             model_name,
             content_blocks,
             stop_reason,
-            prompt_tokens,
+            input_tokens,
             completion_tokens,
+            cache_read_tokens,
         ));
     }
 
@@ -1874,6 +1899,8 @@ pub async fn messages(
             final_stop_reason: "end_turn",
             output_token_count: 0,
             backend_reported_usage: false,
+            backend_input_tokens: None,
+            backend_cache_read_tokens: None,
         };
         let mut sse_parser = SseEventParser::new();
         let mut done = false;
@@ -1968,10 +1995,22 @@ pub async fn messages(
                 .await;
         }
 
+        let cache_read = stream_state.backend_cache_read_tokens.unwrap_or(0);
+        let prompt = stream_state
+            .backend_input_tokens
+            .unwrap_or(input_token_count);
+        let final_input_tokens = prompt.saturating_sub(cache_read);
+        let mut usage = serde_json::json!({
+            "input_tokens": final_input_tokens,
+            "output_tokens": stream_state.output_token_count
+        });
+        if cache_read > 0 {
+            usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
+        }
         let md = json!({
             "type":"message_delta",
             "delta":{"stop_reason":stream_state.final_stop_reason,"stop_sequence":null},
-            "usage":{"output_tokens":stream_state.output_token_count}
+            "usage":usage
         });
         // Critical: if these final events fail, stream is incomplete - but log it
         if tx

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Streaming and non-streaming responses now report exact backend token usage instead of a character-based estimate. The proxy sends `stream_options.include_usage` and reads the final usage-only chunk (`choices: []`), mapping the backend's real counts: `output_tokens` from `completion_tokens`, and `input_tokens`/`cache_read_input_tokens` from `prompt_tokens` and `prompt_tokens_details.cached_tokens` (so prompt-cache hits are reflected per Anthropic semantics). Previously the usage chunk was dropped by the empty-choices guard, `output_tokens` fell back to `text.len()/CHARS_PER_TOKEN`, and cache reads were invisible.
+
 ## [0.1.10] - 2025-11-19
 
 ### Changed

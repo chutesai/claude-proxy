@@ -27,6 +27,11 @@ pub struct OAITool {
 }
 
 #[derive(Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
+}
+
+#[derive(Serialize)]
 pub struct OAIChatReq {
     pub model: String,
     pub messages: Vec<OAIMessage>,
@@ -53,6 +58,8 @@ pub struct OAIChatReq {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
     pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -127,6 +134,12 @@ pub struct OAIStreamChunk {
 }
 
 #[derive(Deserialize, Default, Debug)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+}
+
+#[derive(Deserialize, Default, Debug)]
 pub struct OAIUsage {
     #[serde(default)]
     pub prompt_tokens: Option<u32>,
@@ -135,12 +148,87 @@ pub struct OAIUsage {
     #[serde(default)]
     #[allow(dead_code)]
     pub total_tokens: Option<u32>,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_serialize_stream_options() {
+        // When Some, stream_options is serialized.
+        let req = OAIChatReq {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            reasoning_effort: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["stream_options"]["include_usage"], json!(true));
+
+        // When None, stream_options is omitted.
+        let req_none = OAIChatReq {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            reasoning_effort: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            stream: false,
+            stream_options: None,
+        };
+        let v_none = serde_json::to_value(&req_none).unwrap();
+        assert!(v_none.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn test_deserialize_usage_prompt_tokens_details() {
+        // Cache-hit: prompt_tokens_details present with cached_tokens.
+        let usage: OAIUsage = serde_json::from_value(json!({
+            "prompt_tokens": 541,
+            "completion_tokens": 12,
+            "total_tokens": 553,
+            "prompt_tokens_details": {"cached_tokens": 512}
+        }))
+        .unwrap();
+        assert_eq!(
+            usage.prompt_tokens_details.as_ref().unwrap().cached_tokens,
+            Some(512)
+        );
+
+        // Cold call: prompt_tokens_details is null -> None.
+        let usage_cold: OAIUsage = serde_json::from_value(json!({
+            "prompt_tokens": 120,
+            "completion_tokens": 37,
+            "total_tokens": 157,
+            "prompt_tokens_details": null
+        }))
+        .unwrap();
+        assert!(usage_cold.prompt_tokens_details.is_none());
+    }
 
     #[test]
     fn test_deserialize_stream_chunk_with_reasoning_and_tool_calls() {
