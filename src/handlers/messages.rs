@@ -1478,9 +1478,17 @@ pub async fn messages(
     // Forward client headers, skipping hop-by-hop and headers we set ourselves
     for (name, value) in headers.iter() {
         match name.as_str() {
-            "host" | "connection" | "keep-alive" | "transfer-encoding" | "upgrade"
-            | "proxy-authenticate" | "proxy-authorization" | "te" | "trailers"
-            | "content-type" | "content-length" => {}
+            "host"
+            | "connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "upgrade"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailers"
+            | "content-type"
+            | "content-length" => {}
             _ => {
                 req = req.header(name, value);
             }
@@ -2517,6 +2525,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_messages_streaming_requests_and_reports_exact_backend_usage() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let captured = captured.read().await;
+        assert_eq!(captured[0]["stream_options"]["include_usage"], json!(true));
+        assert!(body.contains(r#""usage":{"input_tokens":2,"output_tokens":1}"#));
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_reads_usage_only_chunk_with_cached_tokens() {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "id": "chatcmpl-usage",
+                "object": "chat.completion.chunk",
+                "model": "zai-org/GLM-4.5-Air",
+                "choices": [{ "index": 0, "delta": { "content": "done" }, "finish_reason": Value::Null }]
+            }),
+            json!({
+                "id": "chatcmpl-usage",
+                "object": "chat.completion.chunk",
+                "model": "zai-org/GLM-4.5-Air",
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+            }),
+            json!({
+                "id": "chatcmpl-usage",
+                "object": "chat.completion.chunk",
+                "model": "zai-org/GLM-4.5-Air",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 541,
+                    "completion_tokens": 12,
+                    "total_tokens": 553,
+                    "prompt_tokens_details": { "cached_tokens": 512 }
+                }
+            })
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(
+            r#""usage":{"cache_read_input_tokens":512,"input_tokens":29,"output_tokens":12}"#
+        ));
+    }
+
+    #[tokio::test]
     async fn test_messages_streaming_flushes_trailing_reasoning_without_final_blank_line() {
         let body = format!(
             "data: {}\n\ndata: {}",
@@ -2654,6 +2740,52 @@ mod tests {
         assert_eq!(parsed["role"], "assistant");
         assert_eq!(parsed["content"][0]["type"], "thinking");
         assert_eq!(parsed["content"][1]["type"], "text");
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_reports_exact_cached_usage() {
+        let backend_url = spawn_static_backend(
+            StatusCode::OK,
+            "application/json",
+            json!({
+                "id": "chatcmpl-usage",
+                "object": "chat.completion",
+                "model": "zai-org/GLM-4.5-Air",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "done" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 541,
+                    "completion_tokens": 12,
+                    "total_tokens": 553,
+                    "prompt_tokens_details": { "cached_tokens": 512 }
+                }
+            })
+            .to_string(),
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(parsed["usage"]["input_tokens"], json!(29));
+        assert_eq!(parsed["usage"]["cache_read_input_tokens"], json!(512));
+        assert_eq!(parsed["usage"]["output_tokens"], json!(12));
     }
 
     #[tokio::test]
